@@ -25,6 +25,7 @@ module Main (main) where
 import Fetch
 
 import Control.Monad (when)
+import Control.Monad.Catch (MonadThrow(..), MonadCatch(..))
 import Data.IORef
 import Data.List (intercalate)
 import Data.Text (Text)
@@ -263,6 +264,109 @@ instance DataSource AppM UserByIdChunked where
       liftIO $ query conn sql chunk
       ) chunks
     pure $ HM.fromList [(UserByIdChunked (userId u), u) | u <- concat results]
+
+-- ══════════════════════════════════════════════
+-- Restricted DB monad (no MonadIO)
+-- ══════════════════════════════════════════════
+
+-- | A restricted monad mimicking Mercury's DB type.
+--
+-- Structurally identical to AppM (ReaderT Connection IO), but
+-- deliberately has NO MonadIO instance. Arbitrary IO inside
+-- database transactions is forbidden at the type level.
+--
+-- sofetch works perfectly with this pattern: the unsafe nats
+-- needed by the engine are private to the module that defines
+-- the runner. Application code never sees them.
+newtype DB a = DB { unDB :: Connection -> IO a }
+
+instance Functor DB where
+  fmap f (DB g) = DB $ \c -> fmap f (g c)
+
+instance Applicative DB where
+  pure a = DB $ \_ -> pure a
+  DB ff <*> DB fx = DB $ \c -> ff c <*> fx c
+
+instance Monad DB where
+  DB ma >>= f = DB $ \c -> do
+    a <- ma c
+    unDB (f a) c
+
+instance MonadThrow DB where
+  throwM e = DB $ \_ -> throwM e
+
+instance MonadCatch DB where
+  catch (DB f) handler = DB $ \c ->
+    catch (f c) (\e -> unDB (handler e) c)
+
+-- Intentionally NO MonadIO instance. Any code that tries
+-- @liftIO@ in DB gets a compile error: "No instance for MonadIO DB".
+-- In production (Mercury), a TypeError instance provides a custom
+-- message. Here the missing instance suffices.
+
+-- ── Escape hatches (private to your DB module) ──
+
+-- | Lift IO into DB. Not exported from your DB module in production.
+-- sofetch's engine needs this internally for cache and IVar operations.
+unsafeLiftIODB :: IO a -> DB a
+unsafeLiftIODB io = DB $ \_ -> io
+
+-- | Lower DB to IO, given a connection. Also not exported.
+unsafeRunDB :: Connection -> DB a -> IO a
+unsafeRunDB conn (DB f) = f conn
+
+-- ── DB-internal helpers (like askConn / liftIO for AppM) ──
+
+askConnDB :: DB Connection
+askConnDB = DB pure
+
+liftIODB :: IO a -> DB a
+liftIODB = unsafeLiftIODB
+
+-- ── DataSource instances for DB ─────────────
+
+instance DataSource DB UserById where
+  batchFetch keysNE = do
+    conn <- askConnDB
+    let keys = NE.toList keysNE
+        ids  = [i | UserById i <- keys]
+        n    = length ids
+        sql  = "SELECT id, name FROM users WHERE id IN " <> inClause n
+    liftIODB $ putStrLn $ "  [SQL] SELECT id, name FROM users WHERE id IN ("
+      <> intercalate ", " (map show ids) <> ")"
+    rows <- liftIODB $ query conn sql ids
+    pure $ HM.fromList [(UserById (userId u), u) | u <- rows]
+
+instance DataSource DB PostsByAuthor where
+  batchFetch keysNE = do
+    conn <- askConnDB
+    let keys = NE.toList keysNE
+        ids  = [i | PostsByAuthor i <- keys]
+        n    = length ids
+        sql  = "SELECT id, author_id, title, body FROM posts WHERE author_id IN " <> inClause n
+    liftIODB $ putStrLn $ "  [SQL] SELECT ... FROM posts WHERE author_id IN ("
+      <> intercalate ", " (map show ids) <> ")"
+    rows <- liftIODB $ query conn sql ids
+    let grouped = HM.fromListWith (++) [(PostsByAuthor (postAuthorId p), [p]) | p <- rows]
+    pure $ HM.union grouped (HM.fromList [(k, []) | k <- keys])
+
+-- ── The SAFE public runner ──────────────────
+
+-- | Run a FetchT computation inside the restricted DB monad.
+--
+-- This is the ONLY function your module exports. The unsafe nats
+-- (unsafeRunDB, unsafeLiftIODB) stay private. Application code
+-- writes against @MonadFetch DB n@ and never touches IO.
+--
+-- This is the pattern from the sofetch docs:
+--
+-- @
+-- fetchInTransaction :: FetchT Transaction a -> Transaction a
+-- fetchInTransaction = runFetchT unsafeRunTransaction unsafeLiftIO
+-- @
+fetchInDB :: FetchT DB a -> DB a
+fetchInDB action = DB $ \conn ->
+  unsafeRunDB conn $ runFetchT (unsafeRunDB conn) unsafeLiftIODB action
 
 -- ══════════════════════════════════════════════
 -- Polymorphic data-access functions
@@ -695,6 +799,28 @@ main = do
     <> " (" <> show (cardCommentCount c) <> " comments)"
     <> maybe "" (\p -> " -- latest: \"" <> T.unpack p <> "\"") (cardPreview c)
     ) cards
+
+  -- ── Scenario 12: Restricted DB monad (no MonadIO) ──
+  header "12" "Restricted DB monad (no MonadIO)"
+  putStrLn "The DB monad has NO MonadIO instance — arbitrary IO inside"
+  putStrLn "database transactions is a compile-time error."
+  putStrLn ""
+  putStrLn "sofetch works via fetchInDB, which hides the unsafe nats."
+  putStrLn "The same polymorphic getUserFeed function works in DB:"
+  putStrLn ""
+
+  -- getUserFeed is polymorphic: (MonadFetch m n, DataSource m UserById, ...)
+  -- It works with both AppM (via runFetch) and DB (via fetchInDB).
+  let runDB :: DB a -> IO a
+      runDB act = unsafeRunDB conn act
+
+  dbResult <- runDB $ fetchInDB $ getUserFeed 1
+  putStrLn $ "  => User: " <> T.unpack (userName (fst dbResult))
+  putStrLn $ "  => Posts: " <> show (length (snd dbResult))
+
+  -- Prove the TypeError works by showing the error message.
+  -- (Uncomment the line below to see the compile-time error:)
+  -- _ <- runDB $ Control.Monad.IO.Class.liftIO (putStrLn "this won't compile")
 
   close conn
   putStrLn ""

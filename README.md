@@ -91,13 +91,22 @@ handleRequest env uid =
   runAppM env $ runFetchT (runAppM env) liftIO (getUserFeed uid)
 ```
 
-For monads that deliberately avoid `MonadIO` (e.g. a `Transaction` type),
-export a convenience runner that hides the unsafe nats:
+For monads that deliberately avoid `MonadIO` (e.g. a `Transaction` type that
+prevents arbitrary IO inside database transactions), export a convenience
+runner that hides the unsafe nats:
 
 ```haskell
 fetchInTransaction :: FetchT Transaction a -> Transaction a
 fetchInTransaction = runFetchT unsafeRunTransaction unsafeLiftIO
 ```
+
+The two natural transformations (`unsafeRunTransaction` and `unsafeLiftIO`)
+stay private to your DB module. Application code calls `fetchInTransaction`
+and never touches IO. The engine uses the nats internally for cache and IVar
+operations, but the public interface is completely safe.
+
+See `examples/SqliteBlog.hs` (scenario 12) for a worked proof-of-concept with
+a `DB` monad that has no `MonadIO` instance.
 
 ### 5. Test it
 
@@ -111,6 +120,57 @@ testGetUserFeed = do
   feed <- runMockFetchT @AppM mocks (getUserFeed (UserId 1))
   assertEqual (feedUser feed) testUser
 ```
+
+## Examples
+
+The `examples/` directory contains two runnable programs that demonstrate
+sofetch against real-world backends. Build them with:
+
+```bash
+stack build --flag sofetch:examples
+stack exec sqlite-blog
+stack exec github-explorer
+```
+
+### SQLite blog platform (`examples/SqliteBlog.hs`)
+
+A blog platform with users, posts, and comments backed by an in-memory SQLite
+database. Every `batchFetch` prints the SQL it executes, and an instrumented
+runner shows round boundaries, key counts, and cache behaviour.
+
+Scenarios include:
+
+- **Applicative batching** -- two data sources dispatched concurrently in one round
+- **N+1 avoidance** -- fan-out from posts to comments in a single `WHERE IN` query
+- **Deduplication** -- overlapping author references across comments, fetched once
+- **Deep N+1 across function boundaries** -- four layers of independently-written
+  functions (`renderBlogPage` → `renderAuthorProfile` → `renderPostWithComments`
+  → `renderComment`), each fetching its own data. `traverse` merges all fetches
+  at the same depth into one round. Three authors × seven posts × twelve comments
+  collapses from 25+ queries to 4.
+- **Faceted queries** -- assembling search result cards where each card needs
+  four independent facets (post, author, comment count, latest comment). Five
+  cards × four facets = 20 potential queries; sofetch does it in 2 rounds / 5
+  SQL queries.
+- **Chunked batching** -- a `DataSource` that splits large `IN` clauses into
+  chunks of 50, transparent to the caller.
+- **Shared cache** -- two separate computations sharing a `CacheRef`, proving
+  that the second run resolves cached keys without hitting the database.
+- **MockFetchT** -- the same polymorphic `getUserFeed` function run against both
+  real SQLite and canned mock data with zero code changes.
+- **Restricted DB monad** -- a `DB` type with no `MonadIO` instance
+  (mimicking Mercury's transaction monad), showing the
+  `fetchInTransaction`-style pattern where the unsafe natural transformations
+  are hidden behind a safe public runner.
+
+### GitHub API explorer (`examples/GitHubExplorer.hs`)
+
+Concurrent exploration of the GitHub REST API using `http-client-tls` and
+`aeson`. Demonstrates sofetch with HTTP backends where the value is
+concurrency, deduplication, and caching rather than SQL batching.
+
+Scenarios include concurrent fan-out, dedup + caching (same user from two code
+paths → one HTTP request), error handling with `tryFetch`, and combinators.
 
 ## How batching works
 
