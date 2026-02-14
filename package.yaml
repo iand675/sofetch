@@ -1,0 +1,94 @@
+name:                sofetch
+version:             0.1.0.0
+github:              "iand675/sofetch"
+license:             BSD-3-Clause
+author:              "Author name here"
+maintainer:          "example@example.com"
+copyright:           "2026 Author name here"
+
+extra-source-files:
+- README.md
+- CHANGELOG.md
+
+# Metadata used when publishing your package
+# synopsis:            Short description of your package
+# category:            Web
+
+# To avoid duplicated efforts in documentation and dealing with the
+# complications of embedding Haddock markup inside cabal files, it is
+# common to point users to the README.md file.
+description:         Please see the README on GitHub at <https://github.com/githubuser/sofetch#readme>
+
+dependencies:
+- base >= 4.7 && < 5
+- async
+- containers
+- exceptions
+- hashable
+- text
+- time
+- unordered-containers
+
+ghc-options:
+- -Wall
+- -Wcompat
+- -Widentities
+- -Wincomplete-record-updates
+- -Wincomplete-uni-patterns
+- -Wmissing-export-lists
+- -Wmissing-home-modules
+- -Wpartial-fields
+- -Wredundant-constraints
+
+flags:
+  examples:
+    description: Build example executables
+    manual: true
+    default: false
+
+library:
+  source-dirs: src
+
+executables:
+  sqlite-blog:
+    main: SqliteBlog.hs
+    source-dirs: examples
+    other-modules: []
+    dependencies:
+      - sofetch
+      - sqlite-simple
+      - bytestring
+    ghc-options:
+      - -threaded
+    when:
+      - condition: "!flag(examples)"
+        buildable: false
+
+  github-explorer:
+    main: GitHubExplorer.hs
+    source-dirs: examples
+    other-modules: []
+    dependencies:
+      - sofetch
+      - http-client
+      - http-client-tls
+      - http-types
+      - aeson
+      - bytestring
+    ghc-options:
+      - -threaded
+    when:
+      - condition: "!flag(examples)"
+        buildable: false
+
+tests:
+  sofetch-test:
+    main:                Spec.hs
+    source-dirs:         test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - sofetch
+    - hspec

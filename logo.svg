@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 120" width="400" height="120">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#8B5CF6;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#EC4899;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="arrow-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#8B5CF6;stop-opacity:0.6" />
+      <stop offset="100%" style="stop-color:#EC4899;stop-opacity:0.6" />
+    </linearGradient>
+  </defs>
+
+  <!-- Batching arrows icon -->
+  <g transform="translate(16, 24)">
+    <!-- Three incoming arrows converging to one -->
+    <path d="M0,12 L28,36" stroke="url(#arrow-grad)" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <path d="M0,36 L28,36" stroke="url(#arrow-grad)" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <path d="M0,60 L28,36" stroke="url(#arrow-grad)" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <!-- Merged single arrow out -->
+    <path d="M28,36 L56,36" stroke="url(#grad)" stroke-width="4" fill="none" stroke-linecap="round"/>
+    <polygon points="56,30 68,36 56,42" fill="url(#grad)"/>
+  </g>
+
+  <!-- "sofetch" text -->
+  <text x="100" y="76" font-family="'SF Mono', 'Fira Code', 'JetBrains Mono', monospace" font-size="54" font-weight="700" fill="url(#grad)" letter-spacing="-1">
+    sofetch
+  </text>
+
+  <!-- Tagline -->
+  <text x="102" y="100" font-family="'SF Pro', 'Inter', 'Helvetica Neue', sans-serif" font-size="14" fill="#6B7280" letter-spacing="0.5">
+    automatic batching for Haskell
+  </text>
+</svg>
