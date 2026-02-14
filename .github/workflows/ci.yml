@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          enable-stack: true
+          stack-no-global: true
+
+      - name: Cache Stack root
+        uses: actions/cache@v4
+        with:
+          path: ~/.stack
+          key: stack-root-${{ runner.os }}-${{ hashFiles('stack.yaml', 'stack.yaml.lock') }}
+          restore-keys: |
+            stack-root-${{ runner.os }}-
+
+      - name: Cache .stack-work
+        uses: actions/cache@v4
+        with:
+          path: |
+            .stack-work
+            sofetch-otel/.stack-work
+          key: stack-work-${{ runner.os }}-${{ hashFiles('stack.yaml', 'stack.yaml.lock', 'package.yaml', 'sofetch-otel/package.yaml') }}
+          restore-keys: |
+            stack-work-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: stack build --test --no-run-tests --dependencies-only
+
+      - name: Build
+        run: stack build --test --no-run-tests --flag sofetch:examples
+
+      - name: Test
+        run: stack test

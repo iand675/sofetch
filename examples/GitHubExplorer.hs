@@ -201,9 +201,9 @@ instance DataSource AppM UserRepos where
 -- Instrumented runner
 -- ══════════════════════════════════════════════
 
--- | Run a FetchT computation with detailed round-by-round logging.
-runFetch :: AppEnv -> FetchT AppM a -> IO a
-runFetch env action = do
+-- | Run a Fetch computation with detailed round-by-round logging.
+runFetchIO :: AppEnv -> Fetch AppM a -> IO a
+runFetchIO env action = do
   cRef <- newCacheRef
   totalRoundsRef <- newIORef (0 :: Int)
   totalKeysRef   <- newIORef (0 :: Int)
@@ -271,7 +271,7 @@ main = do
   -- ── Scenario 1: Concurrent fetches ────────────
   header "1" "Concurrent fetches"
   putStrLn "Fetching two users in parallel (one round, two concurrent HTTP requests)."
-  (u1, u2) <- runFetch env $
+  (u1, u2) <- runFetchIO env $
     (,) <$> fetch (UserLogin "haskell") <*> fetch (UserLogin "rust-lang")
   putStrLn $ "  => " <> showUser u1
   putStrLn $ "  => " <> showUser u2
@@ -279,7 +279,7 @@ main = do
   -- ── Scenario 2: Monadic chain ─────────────────
   header "2" "Monadic chain (2 rounds)"
   putStrLn "Fetching a user, then their repos (data dependency forces 2 rounds)."
-  (user, repos) <- runFetch env $ do
+  (user, repos) <- runFetchIO env $ do
     u <- fetch (UserLogin "haskell")                 -- round 1
     rs <- fetch (UserRepos (ghUserLogin u))          -- round 2
     pure (u, rs)
@@ -290,7 +290,7 @@ main = do
   header "3" "Fan-out (fetch many, then fan out)"
   putStrLn "Fetching 3 users in round 1, then all their repos in round 2."
   let logins = [UserLogin "haskell", UserLogin "rust-lang", UserLogin "golang"]
-  allRepos <- runFetch env $ do
+  allRepos <- runFetchIO env $ do
     users <- fetchAll logins                                    -- round 1: 3 concurrent HTTP
     fetchAll (map (UserRepos . ghUserLogin) users)              -- round 2: 3 concurrent HTTP
   putStrLn $ "  => Repo counts: " <> show (map length allRepos)
@@ -299,7 +299,7 @@ main = do
   header "4" "Deduplication + caching"
   putStrLn "Fetching 'haskell' from TWO code paths. Only ONE HTTP request fires."
   putStrLn "Then fetching 'haskell' again in a later round: cache hit, no HTTP."
-  result <- runFetch env $ do
+  result <- runFetchIO env $ do
     -- Both of these want UserLogin "haskell"; deduplicated into one request
     (a, b) <- (,) <$> fetch (UserLogin "haskell") <*> fetch (UserLogin "haskell")
     -- This monadic bind forces a new round, but the cache has the value
@@ -310,7 +310,7 @@ main = do
   -- ── Scenario 5: Error handling ────────────────
   header "5" "Error handling (tryFetch)"
   putStrLn "Fetching a nonexistent user alongside a real one."
-  (good, bad) <- runFetch env $
+  (good, bad) <- runFetchIO env $
     (,) <$> tryFetch (UserLogin "haskell")
         <*> tryFetch (UserLogin "this-user-definitely-does-not-exist-404-sofetch")
   case good of
@@ -324,14 +324,14 @@ main = do
   header "6" "Combinators (fetchThrough, fetchMap)"
   putStrLn "Using fetchThrough to pair logins with user profiles:"
   let loginTexts = ["haskell", "rust-lang", "golang"] :: [Text]
-  paired <- runFetch env $
+  paired <- runFetchIO env $
     fetchThrough UserLogin loginTexts
   mapM_ (\(login, u) -> putStrLn $ "  => " <> T.unpack login
     <> " -> " <> maybe "?" T.unpack (ghUserName u)) paired
 
   putStrLn ""
   putStrLn "Using fetchMap to extract just follower counts:"
-  counts <- runFetch env $
+  counts <- runFetchIO env $
     fetchMap UserLogin (\login u -> (login, ghUserFollowers u)) loginTexts
   mapM_ (\(login, n) -> putStrLn $ "  => " <> T.unpack login
     <> ": " <> show n <> " followers") counts

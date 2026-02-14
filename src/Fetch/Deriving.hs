@@ -6,14 +6,14 @@
 --
 -- = DerivingVia for transformer newtypes
 --
--- If you define a newtype over 'FetchT', 'MockFetchT', 'MutateT',
+-- If you define a newtype over 'Fetch', 'MockFetch', 'Mutate',
 -- or any of the library's monads, @GeneralizedNewtypeDeriving@ can
 -- derive all the standard instances automatically:
 --
 -- @
 -- {-\# LANGUAGE GeneralizedNewtypeDeriving, DerivingStrategies \#-}
 --
--- newtype AppFetch a = AppFetch ('Fetch.Batched.FetchT' AppM a)
+-- newtype AppFetch a = AppFetch ('Fetch.Batched.Fetch' AppM a)
 --   deriving newtype
 --     ( Functor, Applicative, Monad
 --     , MonadFail, MonadThrow, MonadCatch
@@ -21,10 +21,10 @@
 --     )
 -- @
 --
--- For a newtype over 'MutateT' that also supports mutations:
+-- For a newtype over 'Mutate' that also supports mutations:
 --
 -- @
--- newtype AppMutateT a = AppMutateT ('Fetch.Mutate.MutateT' AppM AppM a)
+-- newtype AppMutate a = AppMutate ('Fetch.Mutate.Mutate' AppM AppM a)
 --   deriving newtype
 --     ( Functor, Applicative, Monad
 --     , MonadFail, MonadThrow, MonadCatch
@@ -33,17 +33,17 @@
 --     )
 -- @
 --
--- For a newtype over 'MockFetchT' in tests:
+-- For a newtype over 'MockFetch' in tests:
 --
 -- @
--- newtype TestFetch a = TestFetch ('Fetch.Mock.MockFetchT' AppM IO a)
+-- newtype TestFetch a = TestFetch ('Fetch.Mock.MockFetch' AppM IO a)
 --   deriving newtype
 --     ( Functor, Applicative, Monad
 --     , 'Fetch.Class.MonadFetch' AppM
 --     )
 -- @
 --
--- The library's own 'Fetch.Traced.TracedFetchT' uses this exact pattern.
+-- The library's own 'Fetch.Traced.TracedFetch' uses this exact pattern.
 --
 -- == Why not FetchKey or DataSource?
 --

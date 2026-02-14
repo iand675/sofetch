@@ -55,8 +55,11 @@ library
     , containers
     , exceptions
     , hashable
+    , semigroupoids
     , text
     , time
+    , transformers
+    , unliftio-core
     , unordered-containers
   default-language: Haskell2010
 
@@ -76,9 +79,12 @@ executable github-explorer
     , http-client
     , http-client-tls
     , http-types
+    , semigroupoids
     , sofetch
     , text
     , time
+    , transformers
+    , unliftio-core
     , unordered-containers
   default-language: Haskell2010
   if !flag(examples)
@@ -96,10 +102,13 @@ executable sqlite-blog
     , containers
     , exceptions
     , hashable
+    , semigroupoids
     , sofetch
     , sqlite-simple
     , text
     , time
+    , transformers
+    , unliftio-core
     , unordered-containers
   default-language: Haskell2010
   if !flag(examples)
@@ -122,8 +131,11 @@ test-suite sofetch-test
     , exceptions
     , hashable
     , hspec
+    , semigroupoids
     , sofetch
     , text
     , time
+    , transformers
+    , unliftio-core
     , unordered-containers
   default-language: Haskell2010

@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://media.giphy.com/media/xT9KVF4zNt70nyNpi8/giphy.gif" alt="That's so fetch" width="300">
+  <img src="fetch.gif" alt="That's so fetch" width="300">
 </p>
 
 ---
@@ -23,12 +23,12 @@ simpler API and monad-transformer design.
   `m`, not a concrete environment. If `m` is `ReaderT AppEnv IO`, your sources
   have access to connection pools, config, etc. Missing instances are
   compile-time errors.
-- **Monad transformer.** `FetchT m a` layers over your source monad. Two
+- **Monad transformer.** `Fetch m a` layers over your source monad. Two
   natural transformations (`m -> IO` and `IO -> m`) bridge the gap at the run
   site.
 - **Swappable implementations.** `MonadFetch m n` is the application-facing
-  typeclass. Production (`FetchT`), traced (`TracedFetchT`), and mock
-  (`MockFetchT`) all satisfy it.
+  typeclass. Production (`Fetch`), traced (`TracedFetch`), and mock
+  (`MockFetch`) all satisfy it.
 - **Extensible instrumentation.** The core provides `runLoopWith` for wrapping
   each batch round (e.g. with tracing spans). OpenTelemetry support lives in
   the separate [`sofetch-otel`](./sofetch-otel) package.
@@ -37,25 +37,66 @@ simpler API and monad-transformer design.
 
 ### 1. Define key types
 
+Each type of data you fetch gets its own key type with a `FetchKey` instance
+that declares the result type. `FetchKey` requires `Typeable`, `Hashable`,
+`Eq`, and `Show` -- all derivable with stock or anyclass strategies:
+
 ```haskell
+{-# LANGUAGE DeriveGeneric, DeriveAnyClass, DerivingStrategies, TypeFamilies #-}
+
+data User = User { userId :: Int, userName :: Text }
+data Post = Post { postId :: Int, postAuthorId :: Int, postTitle :: Text }
+
 newtype UserId = UserId Int
-  deriving (Eq, Hashable, Show)
+  deriving stock (Eq, Ord, Show, Generic)
+  deriving anyclass (Hashable)
 
 instance FetchKey UserId where
   type Result UserId = User
+
+newtype PostsByAuthor = PostsByAuthor Int
+  deriving stock (Eq, Ord, Show, Generic)
+  deriving anyclass (Hashable)
+
+instance FetchKey PostsByAuthor where
+  type Result PostsByAuthor = [Post]
 ```
 
 ### 2. Define data sources
 
+A `DataSource` instance teaches the engine how to batch-fetch keys. The
+monad `m` provides any resources the source needs (connection pool, config,
+etc.). `batchFetch` receives a `NonEmpty k` and must return a `HashMap k
+(Result k)` with an entry for every key:
+
 ```haskell
 newtype AppM a = AppM (ReaderT AppEnv IO a)
-  deriving (Functor, Applicative, Monad, MonadIO, MonadReader AppEnv)
+  deriving (Functor, Applicative, Monad, MonadIO, MonadUnliftIO, MonadReader AppEnv)
 
 instance DataSource AppM UserId where
-  batchFetch ids = do
+  batchFetch keys = do
     pool <- asks appPool
-    liftIO $ withResource pool $ \conn ->
+    let ids = [uid | UserId uid <- toList keys]
+    rows <- liftIO $ withResource pool $ \conn ->
       query conn "SELECT id, name FROM users WHERE id = ANY(?)" (Only ids)
+    pure $ HM.fromList [(UserId (userId u), u) | u <- rows]
+
+instance DataSource AppM PostsByAuthor where
+  batchFetch keys = do
+    pool <- asks appPool
+    let ids = [aid | PostsByAuthor aid <- toList keys]
+    rows <- liftIO $ withResource pool $ \conn ->
+      query conn "SELECT id, author_id, title FROM posts WHERE author_id = ANY(?)" (Only ids)
+    let grouped = HM.fromListWith (++) [(PostsByAuthor (postAuthorId p), [p]) | p <- rows]
+    pure $ HM.union grouped (HM.fromList [(k, []) | k <- toList keys])
+```
+
+If your data source has no native batch API, implement `fetchOne` instead --
+the default `batchFetch` calls it for each key:
+
+```haskell
+instance DataSource AppM UserId where
+  fetchOne (UserId uid) = lookupUserById uid
 ```
 
 ### 3. Write data-access code
@@ -64,9 +105,9 @@ Program against `MonadFetch` -- don't commit to an implementation:
 
 ```haskell
 getUserFeed :: (MonadFetch m n, DataSource m UserId, DataSource m PostsByAuthor)
-            => UserId -> n Feed
+            => Int -> n (User, [Post])
 getUserFeed uid =
-  Feed <$> fetch uid <*> fetch (PostsByAuthor uid)
+  (,) <$> fetch (UserId uid) <*> fetch (PostsByAuthor uid)
 ```
 
 You can also use `ApplicativeDo` if you prefer `do`-notation:
@@ -75,9 +116,9 @@ You can also use `ApplicativeDo` if you prefer `do`-notation:
 {-# LANGUAGE ApplicativeDo #-}
 
 getUserFeed uid = do
-  user  <- fetch uid                  -- batched together
+  user  <- fetch (UserId uid)         -- batched together
   posts <- fetch (PostsByAuthor uid)  -- in one round
-  pure (Feed user posts)
+  pure (user, posts)
 ```
 
 Both forms produce the same batching behaviour -- `ApplicativeDo` is a
@@ -85,19 +126,47 @@ convenience, not a requirement.
 
 ### 4. Run it
 
+If your source monad has a `MonadUnliftIO` instance (true for any
+`ReaderT env IO` stack), use `fetchConfigIO` to build the config -- no
+manual natural transformations needed:
+
 ```haskell
-handleRequest :: AppEnv -> UserId -> IO Feed
-handleRequest env uid =
-  runAppM env $ runFetchT (runAppM env) liftIO (getUserFeed uid)
+handleRequest :: AppEnv -> Int -> IO (User, [Post])
+handleRequest env uid = runAppM env $ do
+  cfg <- fetchConfigIO
+  runFetch cfg (getUserFeed uid)
 ```
 
-For monads that deliberately avoid `MonadIO` (e.g. a `Transaction` type that
-prevents arbitrary IO inside database transactions), export a convenience
-runner that hides the unsafe nats:
+To preserve the cache across sequential phases, use `runFetch'` which
+returns the `CacheRef` alongside the result:
 
 ```haskell
-fetchInTransaction :: FetchT Transaction a -> Transaction a
-fetchInTransaction = runFetchT unsafeRunTransaction unsafeLiftIO
+handleTwoPhases :: AppEnv -> IO [Post]
+handleTwoPhases env = runAppM env $ do
+  cfg <- fetchConfigIO
+
+  -- Phase 1: populate cache
+  (_users, cache) <- runFetch' cfg $
+    fetchAll [UserId 1, UserId 2, UserId 3]
+
+  -- Phase 2: reuse the warm cache — cached keys resolve without hitting the DB
+  runFetch cfg { configCache = Just cache } $
+    fetchAll [PostsByAuthor 1, PostsByAuthor 2]
+```
+
+You can also create a `CacheRef` up front with `newCacheRef` and thread it
+through multiple `runFetch` calls via `cfg { configCache = Just cRef }`.
+
+#### Monads without `MonadUnliftIO`
+
+For monads that deliberately avoid `MonadIO` (e.g. a `Transaction` type
+that prevents arbitrary IO inside database transactions), use `fetchConfig`
+with explicit natural transformations and export a convenience runner that
+hides the unsafe nats:
+
+```haskell
+fetchInTransaction :: Fetch Transaction a -> Transaction a
+fetchInTransaction = runFetch (fetchConfig unsafeRunTransaction unsafeLiftIO)
 ```
 
 The two natural transformations (`unsafeRunTransaction` and `unsafeLiftIO`)
@@ -110,15 +179,16 @@ a `DB` monad that has no `MonadIO` instance.
 
 ### 5. Test it
 
-Swap to `MockFetchT` with canned data -- no IO, no database:
+Swap to `MockFetch` with canned data -- no IO, no database:
 
 ```haskell
 testGetUserFeed :: IO ()
 testGetUserFeed = do
-  let mocks = mockData @UserId      [(UserId 1, testUser)]
-           <> mockData @PostsByAuthor [(PostsByAuthor 1, [testPost])]
-  feed <- runMockFetchT @AppM mocks (getUserFeed (UserId 1))
-  assertEqual (feedUser feed) testUser
+  let mocks = mockData @UserId        [(UserId 1, testUser)]
+           <> mockData @PostsByAuthor  [(PostsByAuthor 1, [testPost])]
+  (user, posts) <- runMockFetch @AppM mocks (getUserFeed 1)
+  assertEqual user testUser
+  assertEqual posts [testPost]
 ```
 
 ## Examples
@@ -156,7 +226,7 @@ Scenarios include:
   chunks of 50, transparent to the caller.
 - **Shared cache** -- two separate computations sharing a `CacheRef`, proving
   that the second run resolves cached keys without hitting the database.
-- **MockFetchT** -- the same polymorphic `getUserFeed` function run against both
+- **MockFetch** -- the same polymorphic `getUserFeed` function run against both
   real SQLite and canned mock data with zero code changes.
 - **Restricted DB monad** -- a `DB` type with no `MonadIO` instance
   (mimicking Mercury's transaction monad), showing the
@@ -174,7 +244,7 @@ paths → one HTTP request), error handling with `tryFetch`, and combinators.
 
 ## How batching works
 
-`FetchT` has an `Applicative` instance that merges pending fetches from both
+`Fetch` has an `Applicative` instance that merges pending fetches from both
 sides of `<*>` into a single round. The `Monad` instance introduces a round
 boundary at `>>=` (the right side depends on the left side's result).
 
@@ -192,8 +262,8 @@ entire computation.
 
 | Package | Description |
 |---|---|
-| **sofetch** | Core library: `FetchT`, `DataSource`, `MonadFetch`, cache, engine, mocks, tracing hooks |
-| **[sofetch-otel](./sofetch-otel)** | OpenTelemetry instrumentation via `runFetchTWithOTel` |
+| **sofetch** | Core library: `Fetch`, `DataSource`, `MonadFetch`, cache, engine, mocks, tracing hooks |
+| **[sofetch-otel](./sofetch-otel)** | OpenTelemetry instrumentation via `runFetchWithOTel` |
 
 ## Extension API
 
@@ -213,14 +283,14 @@ See the [Extension API](./src/Fetch.hs) section in the module docs and
 |---|---|
 | `Fetch` | Top-level re-exports |
 | `Fetch.Class` | `FetchKey`, `DataSource`, `MonadFetch`, `MonadFetchBatch`, `Status`, `Batches` |
-| `Fetch.Batched` | `FetchT` monad transformer, runners, `runLoopWith` |
+| `Fetch.Batched` | `Fetch` monad transformer, runners, `runLoopWith` |
 | `Fetch.Engine` | Batch dispatch with strategy-based scheduling |
 | `Fetch.Cache` | IVar-based cache with dedup, eviction, warming |
 | `Fetch.IVar` | Write-once variable with error support |
 | `Fetch.Combinators` | `fetchAll`, `fetchThrough`, `fetchMap`, etc. |
-| `Fetch.Mock` | `MockFetchT` for testing |
-| `Fetch.Traced` | `TracedFetchT` with per-round callbacks |
-| `Fetch.Mutate` | `MutateT` for interleaved read-write computations |
+| `Fetch.Mock` | `MockFetch` for testing |
+| `Fetch.Traced` | `TracedFetch` with per-round callbacks |
+| `Fetch.Mutate` | `Mutate` for interleaved read-write computations |
 | `Fetch.Memo` | `MemoStore`, `memo`, `memoOn` |
 | `Fetch.Deriving` | Helpers for writing instances (`optionalBatchFetch`, DerivingVia docs) |
 

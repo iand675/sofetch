@@ -119,8 +119,8 @@ data CachePolicy
 -- runner:
 --
 -- @
--- fetchInTransaction :: FetchT Transaction a -> Transaction a
--- fetchInTransaction = runFetchT unsafeRunTransaction unsafeLiftIO
+-- fetchInTransaction :: Fetch Transaction a -> Transaction a
+-- fetchInTransaction = runFetch unsafeRunTransaction unsafeLiftIO
 -- @
 --
 -- This keeps the unsafe escape hatches private while giving users
@@ -279,7 +279,7 @@ singletonBatch k = Batches $
 --
 -- @m@ is the /source monad/ (the monad that 'DataSource'
 -- implementations run in). @n@ is the /fetch monad/: the monad
--- your application code runs in, typically 'FetchT' @m@.
+-- your application code runs in, typically 'Fetch' @m@.
 --
 -- The functional dependency @n -> m@ means the source monad is
 -- determined by the fetch monad.

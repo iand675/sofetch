@@ -11,14 +11,14 @@
 
 -- | Principled mutation support for sofetch.
 --
--- 'MutateT' is a free-monad-like transformer layered on top of 'FetchT'.
+-- 'Mutate' is a free-monad-like transformer layered on top of 'Fetch'.
 -- A computation is a sequence of __fetch phases__ (batched reads via
--- 'FetchT') interleaved with __mutation steps__ (sequential writes).
+-- 'Fetch') interleaved with __mutation steps__ (sequential writes).
 --
--- Mutations are inert data during 'FetchT' probing; they only
+-- Mutations are inert data during 'Fetch' probing; they only
 -- execute when the runner processes them. This guarantees:
 --
--- * Within a fetch phase: all fetches batch via 'FetchT'\'s 'Applicative'.
+-- * Within a fetch phase: all fetches batch via 'Fetch'\'s 'Applicative'.
 -- * Between phases: mutations execute one at a time, sequentially.
 -- * In @\<*\>@: fetches run first (batched), then mutations left-to-right.
 -- * Cache consistency: 'reconcileCache' runs after each mutation,
@@ -27,18 +27,17 @@ module Fetch.Mutate
   ( -- * Mutation classes
     MutationSource(..)
   , MonadMutate(..)
-    -- * MutateT transformer
-  , MutateT(..)
+    -- * Mutate transformer
+  , Mutate(..)
   , Step(..)
-  , liftFetchT
+  , liftFetch
     -- * Runners
-  , runMutateT
-  , runMutateTWithCache
+  , runMutate
   ) where
 
 import Fetch.Class
 import Fetch.Cache (CacheRef, newCacheRef)
-import Fetch.Batched (FetchT, runFetchTWithCache)
+import Fetch.Batched (Fetch, FetchConfig(..), runFetch)
 
 import Control.Exception (try)
 import Control.Monad.Catch (MonadThrow(..), MonadCatch(..))
@@ -63,7 +62,7 @@ import Control.Monad.Catch (MonadThrow(..), MonadCatch(..))
 -- @
 class (MutationKey k, Typeable (MutationResult k)) => MutationSource m k where
   -- | Execute the mutation. Called by the runner, never during
-  -- 'FetchT' probing.
+  -- 'Fetch' probing.
   executeMutation :: k -> m (MutationResult k)
 
   -- | Reconcile the cache after a successful mutation.
@@ -103,9 +102,9 @@ class MonadFetch m n => MonadMutate m n | n -> m where
 data Step m n a
   = StepDone a
   | forall k. MutationSource m k
-    => StepMutate k (MutationResult k -> MutateT m n a)
+    => StepMutate k (MutationResult k -> Mutate m n a)
   | forall k. MutationSource m k
-    => StepTryMutate k (Either SomeException (MutationResult k) -> MutateT m n a)
+    => StepTryMutate k (Either SomeException (MutationResult k) -> Mutate m n a)
 
 -- | Map a function over the final value of a 'Step'.
 mapStep :: Monad n => (a -> b) -> Step m n a -> Step m n b
@@ -135,48 +134,48 @@ apStep (StepTryMutate k1 cont1) step2 =
   StepTryMutate k1 $ \r1 ->
     cont1 r1 <*> embedStep step2
 
--- | Inject a 'Step' into 'MutateT' as a trivial fetch phase.
-embedStep :: Monad n => Step m n a -> MutateT m n a
-embedStep (StepDone a)          = MutateT (pure (StepDone a))
-embedStep (StepMutate k cont)   = MutateT (pure (StepMutate k cont))
-embedStep (StepTryMutate k cont) = MutateT (pure (StepTryMutate k cont))
+-- | Inject a 'Step' into 'Mutate' as a trivial fetch phase.
+embedStep :: Monad n => Step m n a -> Mutate m n a
+embedStep (StepDone a)          = Mutate (pure (StepDone a))
+embedStep (StepMutate k cont)   = Mutate (pure (StepMutate k cont))
+embedStep (StepTryMutate k cont) = Mutate (pure (StepTryMutate k cont))
 
 -- ──────────────────────────────────────────────
--- MutateT
+-- Mutate
 -- ──────────────────────────────────────────────
 
 -- | A computation that interleaves batched fetch phases with
 -- sequential mutations.
 --
--- @m@ is the source monad (same as in 'DataSource' and 'FetchT').
--- @n@ is the base monad for 'FetchT'.
+-- @m@ is the source monad (same as in 'DataSource' and 'Fetch').
+-- @n@ is the base monad for 'Fetch'.
 --
--- In practice, @n@ is always @m@ and 'MutateT m m' is layered on
--- 'FetchT m'.
+-- In practice, @n@ is always @m@ and 'Mutate m m' is layered on
+-- 'Fetch m'.
 --
 -- @
 -- do (user, posts) <- (,) \<$\> fetch uid \<*\> fetch pid  -- batched
 --    updated <- mutate (UpdateUserName uid "new")        -- mutation boundary
 --    fetch uid                                            -- cache hit
 -- @
-newtype MutateT m n a = MutateT
-  { unMutateT :: FetchT n (Step m n a) }
+newtype Mutate m n a = Mutate
+  { unMutate :: Fetch n (Step m n a) }
 
-instance Monad n => Functor (MutateT m n) where
-  fmap f (MutateT inner) = MutateT (fmap (mapStep f) inner)
+instance Monad n => Functor (Mutate m n) where
+  fmap f (Mutate inner) = Mutate (fmap (mapStep f) inner)
 
-instance Monad n => Applicative (MutateT m n) where
-  pure a = MutateT (pure (StepDone a))
+instance Monad n => Applicative (Mutate m n) where
+  pure a = Mutate (pure (StepDone a))
 
-  MutateT ff <*> MutateT fx = MutateT $
-    -- Delegate to FetchT's Applicative for batching, then combine Steps.
+  Mutate ff <*> Mutate fx = Mutate $
+    -- Delegate to Fetch's Applicative for batching, then combine Steps.
     liftA2 apStep ff fx
 
-instance Monad n => Monad (MutateT m n) where
-  MutateT ma >>= f = MutateT $ do
-    step <- ma  -- runs in FetchT
+instance Monad n => Monad (Mutate m n) where
+  Mutate ma >>= f = Mutate $ do
+    step <- ma  -- runs in Fetch
     case step of
-      StepDone a -> unMutateT (f a)  -- continue in same FetchT phase
+      StepDone a -> unMutate (f a)  -- continue in same Fetch phase
       StepMutate k cont ->
         pure $ StepMutate k (\r -> cont r >>= f)
       StepTryMutate k cont ->
@@ -186,76 +185,69 @@ instance Monad n => Monad (MutateT m n) where
 -- Instances
 -- ──────────────────────────────────────────────
 
-instance Monad m => MonadFetch m (MutateT m m) where
-  fetch k      = MutateT (StepDone <$> fetch k)
-  tryFetch k   = MutateT (StepDone <$> tryFetch k)
-  primeCache k v = MutateT (StepDone <$> primeCache k v)
+instance Monad m => MonadFetch m (Mutate m m) where
+  fetch k      = Mutate (StepDone <$> fetch k)
+  tryFetch k   = Mutate (StepDone <$> tryFetch k)
+  primeCache k v = Mutate (StepDone <$> primeCache k v)
 
-instance Monad m => MonadMutate m (MutateT m m) where
-  mutate k    = MutateT (pure (StepMutate k pure))
-  tryMutate k = MutateT (pure (StepTryMutate k pure))
+instance Monad m => MonadMutate m (Mutate m m) where
+  mutate k    = Mutate (pure (StepMutate k pure))
+  tryMutate k = Mutate (pure (StepTryMutate k pure))
 
-instance MonadFail m => MonadFail (MutateT m m) where
-  fail msg = MutateT (fail msg)
+instance MonadFail m => MonadFail (Mutate m m) where
+  fail msg = Mutate (fail msg)
 
-instance MonadThrow m => MonadThrow (MutateT m m) where
-  throwM e = MutateT (throwM e)
+instance MonadThrow m => MonadThrow (Mutate m m) where
+  throwM e = Mutate (throwM e)
 
--- | Propagates the handler through both 'FetchT' round continuations
--- (handled by 'FetchT'\'s 'MonadCatch') and 'Step' mutation
+-- | Propagates the handler through both 'Fetch' round continuations
+-- (handled by 'Fetch'\'s 'MonadCatch') and 'Step' mutation
 -- continuations.
-instance MonadCatch m => MonadCatch (MutateT m m) where
-  catch (MutateT inner) handler = MutateT $
+instance MonadCatch m => MonadCatch (Mutate m m) where
+  catch (Mutate inner) handler = Mutate $
     fmap catchStep $
-      catch inner (\ex -> unMutateT (handler ex))
+      catch inner (\ex -> unMutate (handler ex))
     where
       catchStep (StepDone a)           = StepDone a
       catchStep (StepMutate k cont)    = StepMutate k (\r -> catch (cont r) handler)
       catchStep (StepTryMutate k cont) = StepTryMutate k (\r -> catch (cont r) handler)
 
--- | Lift a 'FetchT' computation into 'MutateT'.
--- The entire 'FetchT' runs as a single fetch phase.
-liftFetchT :: Monad m => FetchT m a -> MutateT m m a
-liftFetchT action = MutateT (StepDone <$> action)
+-- | Lift a 'Fetch' computation into 'Mutate'.
+-- The entire 'Fetch' runs as a single fetch phase.
+liftFetch :: Monad m => Fetch m a -> Mutate m m a
+liftFetch action = Mutate (StepDone <$> action)
 
 -- ──────────────────────────────────────────────
 -- Runners
 -- ──────────────────────────────────────────────
 
--- | Run a 'MutateT' computation with a fresh cache.
-runMutateT :: Monad m
-           => (forall x. m x -> IO x)
-           -> (forall x. IO x -> m x)
-           -> MutateT m m a
-           -> m a
-runMutateT lower lift action = do
-  cRef <- lift newCacheRef
-  runMutateTWithCache lower lift cRef action
-
--- | Run a 'MutateT' computation with an externally-provided cache.
--- Useful for sharing cache across runs or pre-warming.
-runMutateTWithCache :: forall m a. Monad m
-                    => (forall x. m x -> IO x)
-                    -> (forall x. IO x -> m x)
-                    -> CacheRef
-                    -> MutateT m m a
-                    -> m a
-runMutateTWithCache lower lift cRef = go
-  where
-    go :: MutateT m m a -> m a
-    go (MutateT fetchPhase) = do
-      step <- runFetchTWithCache lower lift cRef fetchPhase
-      case step of
-        StepDone a -> pure a
-        StepMutate k cont -> do
-          result <- executeMutation k
-          lift $ reconcileCache @m k result cRef
-          go (cont result)
-        StepTryMutate k cont -> do
-          result <- lift $ try $ lower $ executeMutation k
-          case result of
-            Right v -> do
-              lift $ reconcileCache @m k v cRef
-              go (cont (Right v))
-            Left ex ->
-              go (cont (Left ex))
+-- | Run a 'Mutate' computation.
+--
+-- @
+-- let cfg = fetchConfig (runAppM env) liftIO
+-- runMutate cfg action
+-- @
+runMutate :: forall m a. Monad m => FetchConfig m -> Mutate m m a -> m a
+runMutate cfg action = do
+  cRef <- case configCache cfg of
+    Just ref -> pure ref
+    Nothing  -> configLift cfg newCacheRef
+  let fetchCfg = cfg { configCache = Just cRef }
+      go :: Mutate m m a -> m a
+      go (Mutate fetchPhase) = do
+        step <- runFetch fetchCfg fetchPhase
+        case step of
+          StepDone a -> pure a
+          StepMutate k cont -> do
+            result <- executeMutation k
+            configLift cfg $ reconcileCache @m k result cRef
+            go (cont result)
+          StepTryMutate k cont -> do
+            result <- configLift cfg $ try $ configLower cfg $ executeMutation k
+            case result of
+              Right v -> do
+                configLift cfg $ reconcileCache @m k v cRef
+                go (cont (Right v))
+              Left ex ->
+                go (cont (Left ex))
+  go action

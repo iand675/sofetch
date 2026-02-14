@@ -34,7 +34,7 @@
 --     errors.
 --
 --   * __Monad transformer, not a concrete monad.__ Haxl's @GenHaxl u w@ is
---     a fixed monad. 'FetchT' is a transformer over your source monad @m@.
+--     a fixed monad. 'Fetch' is a transformer over your source monad @m@.
 --     Two natural transformations (@m x -> IO x@ and @IO x -> m x@) provided
 --     at the run site bridge the source monad with IO for internal
 --     concurrency and caching.
@@ -45,7 +45,7 @@
 --
 -- = How batching works
 --
--- 'FetchT' has an 'Applicative' instance that /merges/ the pending fetches
+-- 'Fetch' has an 'Applicative' instance that /merges/ the pending fetches
 -- from both sides of @\<*\>@ into one round, and a 'Monad' instance where
 -- @>>=@ is a round boundary (the right side can't run until the left side's
 -- results are available).
@@ -176,26 +176,26 @@
 --
 -- == Step 4: Run it
 --
--- In production, use 'runFetchT' with two natural transformations: one
+-- In production, use 'runFetch' with two natural transformations: one
 -- to lower @m@ to @IO@, and one to lift @IO@ into @m@:
 --
 -- @
 -- handleRequest :: AppEnv -> UserId -> IO Feed
 -- handleRequest env uid =
---   runAppM env $ runFetchT (runAppM env) liftIO (getUserFeed uid)
+--   runAppM env $ runFetch (runAppM env) liftIO (getUserFeed uid)
 -- @
 --
 -- For monads that deliberately avoid 'MonadIO' (e.g. a @Transaction@
 -- type), export a convenience runner that hides the unsafe nats:
 --
 -- @
--- fetchInTransaction :: FetchT Transaction a -> Transaction a
--- fetchInTransaction = runFetchT unsafeRunTransaction unsafeLiftIO
+-- fetchInTransaction :: Fetch Transaction a -> Transaction a
+-- fetchInTransaction = runFetch unsafeRunTransaction unsafeLiftIO
 -- @
 --
 -- == Step 5: Test it
 --
--- Use 'MockFetchT' to run the same code against canned data, with no IO,
+-- Use 'MockFetch' to run the same code against canned data, with no IO,
 -- no database, and no cache:
 --
 -- @
@@ -203,12 +203,12 @@
 -- testGetUserFeed = do
 --   let mocks = mockData \@UserId      [(UserId 1, testUser)]
 --            <> mockData \@PostsByAuthor [(PostsByAuthor 1, [testPost])]
---   feed <- runMockFetchT \@AppM mocks (getUserFeed (UserId 1))
+--   feed <- runMockFetch \@AppM mocks (getUserFeed (UserId 1))
 --   assertEqual (feedUser feed) testUser
 -- @
 --
 -- Because @getUserFeed@ is polymorphic in @n@, no code changes are needed
--- to swap between 'FetchT' (production) and 'MockFetchT' (tests).
+-- to swap between 'Fetch' (production) and 'MockFetch' (tests).
 --
 -- = Error handling
 --
@@ -217,10 +217,10 @@
 -- re-thrown; callers using 'tryFetch' receive @Left SomeException@.
 -- Failures for one key do not affect other keys in the same batch.
 --
--- All monad transformers ('FetchT', 'TracedFetchT', 'MutateT',
--- 'MockFetchT', 'MockMutateT') provide @MonadThrow@ and @MonadCatch@
+-- All monad transformers ('Fetch', 'TracedFetch', 'Mutate',
+-- 'MockFetch', 'MockMutate') provide @MonadThrow@ and @MonadCatch@
 -- instances from the @exceptions@ package. The 'MonadCatch' instance
--- on 'FetchT' propagates the handler through 'Blocked' continuations,
+-- on 'Fetch' propagates the handler through 'Blocked' continuations,
 -- so a @catch@ wrapping a multi-round computation catches exceptions
 -- thrown in any round, not just the initial probe.
 --
@@ -241,7 +241,7 @@
 --   * 'FetchStrategy': control whether a source runs concurrently,
 --     sequentially, or with eager start.
 --   * 'CachePolicy': opt out of caching for mutation-like sources.
---   * 'TracedFetchT': round-by-round observability hooks.
+--   * 'TracedFetch': round-by-round observability hooks.
 --   * 'runLoopWith': build custom instrumented runners (e.g. for
 --     OpenTelemetry) by wrapping around each batch round.
 --   * 'MemoStore': cache derived computations (not just raw fetches).
@@ -269,19 +269,20 @@ module Fetch
   , fetchMapWith
 
     -- * Running
-    -- | Execute a 'MonadFetch' computation. Provide two natural
-    -- transformations: @m x -> IO x@ (to lower) and @IO x -> m x@
-    -- (to lift).
-  , FetchT
+    -- | Execute a 'MonadFetch' computation via 'FetchConfig'.
+  , Fetch
+  , FetchConfig(..)
+  , fetchConfig
+  , fetchConfigIO
   , liftSource
-  , runFetchT
-  , runFetchTWithCache
+  , runFetch
+  , runFetch'
 
     -- * Testing
-    -- | Swap 'FetchT' for 'MockFetchT' to run the same polymorphic code
+    -- | Swap 'Fetch' for 'MockFetch' to run the same polymorphic code
     -- against canned data: no IO, no database, no cache.
-  , MockFetchT
-  , runMockFetchT
+  , MockFetch
+  , runMockFetch
   , ResultMap
   , mockData
   , emptyMockData
@@ -292,7 +293,7 @@ module Fetch
     -- never batched, deduplicated, or cached: each 'mutate' call executes
     -- exactly once, in order.
     --
-    -- 'MutateT' layers on top of 'FetchT'. A computation alternates between
+    -- 'Mutate' layers on top of 'Fetch'. A computation alternates between
     -- __fetch phases__ (where reads batch normally via 'Applicative') and
     -- __mutation steps__ (where writes run sequentially). After each
     -- mutation, 'reconcileCache' lets you evict stale entries or warm
@@ -304,8 +305,8 @@ module Fetch
     -- that is domain knowledge only you have. If you forget to evict or
     -- re-warm a stale entry in 'reconcileCache', subsequent fetches will
     -- silently return the old value. For many applications the simpler
-    -- approach is to keep mutations in plain @IO@ and use 'FetchT' only
-    -- for the read path; 'MutateT' is there for cases where interleaved
+    -- approach is to keep mutations in plain @IO@ and use 'Fetch' only
+    -- for the read path; 'Mutate' is there for cases where interleaved
     -- read-after-write within a single computation is genuinely needed.
 
     -- ** Defining mutations
@@ -314,14 +315,13 @@ module Fetch
 
     -- ** Running mutations
   , MonadMutate(..)
-  , MutateT
-  , runMutateT
-  , runMutateTWithCache
-  , liftFetchT
+  , Mutate
+  , runMutate
+  , liftFetch
 
     -- ** Testing mutations
-  , MockMutateT
-  , runMockMutateT
+  , MockMutate
+  , runMockMutate
   , MutationHandlers
   , mockMutation
   , emptyMutationHandlers
@@ -344,14 +344,14 @@ module Fetch
   , cacheContents
 
     -- * Tracing and observability
-    -- | 'TracedFetchT' is a turnkey wrapper with per-round callbacks.
+    -- | 'TracedFetch' is a turnkey wrapper with per-round callbacks.
     -- For richer instrumentation (e.g. OpenTelemetry spans), build a
     -- custom runner using the extension API below.
-  , TracedFetchT
+  , TracedFetch
   , TraceConfig(..)
   , defaultTraceConfig
   , FetchStats(..)
-  , runTracedFetchT
+  , runTracedFetch
 
     -- * Memoization
     -- | Cache derived computations (not just raw fetches) within a request.
@@ -379,7 +379,7 @@ module Fetch
     -- myInstrumentedRunner :: Monad m
     --                      => (forall x. m x -> IO x)
     --                      -> (forall x. IO x -> m x)
-    --                      -> FetchT m a -> m a
+    --                      -> Fetch m a -> m a
     -- myInstrumentedRunner lower lift action = do
     --   cRef <- lift 'newCacheRef'
     --   let e = 'FetchEnv' cRef lower lift
@@ -392,7 +392,7 @@ module Fetch
     -- @
     --
     -- For full control (e.g. running entirely in @IO@ with a single
-    -- @lift@ at the boundary), use 'FetchT'\'s constructor, 'FetchEnv',
+    -- @lift@ at the boundary), use 'Fetch'\'s constructor, 'FetchEnv',
     -- and 'executeBatches' directly.
 
     -- ** Loop helpers
@@ -428,8 +428,8 @@ module Fetch
 
 import Fetch.Class
 import Fetch.Batched
-  ( FetchT, FetchEnv(..), liftSource
-  , runFetchT, runFetchTWithCache
+  ( Fetch, FetchConfig(..), fetchConfig, fetchConfigIO, FetchEnv(..), liftSource
+  , runFetch, runFetch'
   , runLoop, runLoopWith
   )
 import Fetch.Cache
@@ -444,13 +444,13 @@ import Fetch.Deriving (optionalBatchFetch, traverseBatchFetch)
 import Fetch.Engine (RoundStats(..), emptyRoundStats, executeBatches)
 import Fetch.Mutate
   ( MutationSource(..), MonadMutate(..)
-  , MutateT, runMutateT, runMutateTWithCache, liftFetchT
+  , Mutate, runMutate, liftFetch
   )
 import Fetch.Mock
-  ( MockFetchT, runMockFetchT, ResultMap, mockData, emptyMockData
-  , MockMutateT, runMockMutateT, MutationHandlers, mockMutation
+  ( MockFetch, runMockFetch, ResultMap, mockData, emptyMockData
+  , MockMutate, runMockMutate, MutationHandlers, mockMutation
   , emptyMutationHandlers, RecordedMutation(..)
   )
-import Fetch.Traced (TracedFetchT, TraceConfig(..), defaultTraceConfig, FetchStats(..), runTracedFetchT)
+import Fetch.Traced (TracedFetch, TraceConfig(..), defaultTraceConfig, FetchStats(..), runTracedFetch)
 import Fetch.Memo (MemoKey(..), MemoStore, newMemoStore, memo, memoOn)
 import Fetch.IVar (FetchError(..))

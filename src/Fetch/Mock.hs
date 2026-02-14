@@ -11,14 +11,14 @@
 
 module Fetch.Mock
   ( -- * Mock fetch
-    MockFetchT
-  , runMockFetchT
+    MockFetch
+  , runMockFetch
   , ResultMap
   , mockData
   , emptyMockData
     -- * Mock mutations
-  , MockMutateT
-  , runMockMutateT
+  , MockMutate
+  , runMockMutate
   , MutationHandlers
   , mockMutation
   , emptyMutationHandlers
@@ -83,46 +83,46 @@ lookupMock (ResultMap m) k =
 --
 -- The @m@ phantom type parameter means the same @MonadFetch m n@
 -- constraints work in both production and test code. Users specify
--- @m@ at the call site (e.g. @runMockFetchT \@AppM mocks action@).
+-- @m@ at the call site (e.g. @runMockFetch \@AppM mocks action@).
 -- | @m@ is a phantom type representing the source monad (for instance selection).
-newtype MockFetchT (m :: Type -> Type) n a = MockFetchT { unMockFetchT :: ResultMap -> n a }
+newtype MockFetch (m :: Type -> Type) n a = MockFetch { unMockFetch :: ResultMap -> n a }
 
-instance Functor n => Functor (MockFetchT m n) where
-  fmap f (MockFetchT g) = MockFetchT (fmap f . g)
+instance Functor n => Functor (MockFetch m n) where
+  fmap f (MockFetch g) = MockFetch (fmap f . g)
 
-instance Applicative n => Applicative (MockFetchT m n) where
-  pure a = MockFetchT $ \_ -> pure a
-  MockFetchT ff <*> MockFetchT fx = MockFetchT $ \rm ->
+instance Applicative n => Applicative (MockFetch m n) where
+  pure a = MockFetch $ \_ -> pure a
+  MockFetch ff <*> MockFetch fx = MockFetch $ \rm ->
     ff rm <*> fx rm
 
-instance Monad n => Monad (MockFetchT m n) where
-  MockFetchT ma >>= f = MockFetchT $ \rm -> do
+instance Monad n => Monad (MockFetch m n) where
+  MockFetch ma >>= f = MockFetch $ \rm -> do
     a <- ma rm
-    unMockFetchT (f a) rm
+    unMockFetch (f a) rm
 
 -- | Note: the 'DataSource m k' constraint is still required for
 -- type inference, but the batchFetch is never used.
 -- Only the ResultMap is consulted.
-instance Monad n => MonadFetch m (MockFetchT m n) where
-  fetch k = MockFetchT $ \rm ->
+instance Monad n => MonadFetch m (MockFetch m n) where
+  fetch k = MockFetch $ \rm ->
     case lookupMock rm k of
       Right v -> pure v
       Left ex -> throw ex
 
-  tryFetch k = MockFetchT $ \rm ->
+  tryFetch k = MockFetch $ \rm ->
     pure (lookupMock rm k)
 
   primeCache _ _ = pure ()
 
-instance MonadFail n => MonadFail (MockFetchT m n) where
-  fail msg = MockFetchT $ \_ -> fail msg
+instance MonadFail n => MonadFail (MockFetch m n) where
+  fail msg = MockFetch $ \_ -> fail msg
 
-instance MonadThrow n => MonadThrow (MockFetchT m n) where
-  throwM e = MockFetchT $ \_ -> throwM e
+instance MonadThrow n => MonadThrow (MockFetch m n) where
+  throwM e = MockFetch $ \_ -> throwM e
 
-instance MonadCatch n => MonadCatch (MockFetchT m n) where
-  catch (MockFetchT f) handler = MockFetchT $ \rm ->
-    catch (f rm) (\e -> unMockFetchT (handler e) rm)
+instance MonadCatch n => MonadCatch (MockFetch m n) where
+  catch (MockFetch f) handler = MockFetch $ \rm ->
+    catch (f rm) (\e -> unMockFetch (handler e) rm)
 
 -- | Run a computation against mock data.
 --
@@ -131,11 +131,11 @@ instance MonadCatch n => MonadCatch (MockFetchT m n) where
 -- testGetUserFeed = do
 --   let mocks = mockData \@UserId [(UserId 1, testUser)]
 --            <> mockData \@PostsByAuthor [(PostsByAuthor 1, [testPost])]
---   feed <- runMockFetchT \@AppM mocks (getUserFeed (UserId 1))
+--   feed <- runMockFetch \@AppM mocks (getUserFeed (UserId 1))
 --   assertEqual (feedUser feed) testUser
 -- @
-runMockFetchT :: ResultMap -> MockFetchT m n a -> n a
-runMockFetchT rm (MockFetchT f) = f rm
+runMockFetch :: ResultMap -> MockFetch m n a -> n a
+runMockFetch rm (MockFetch f) = f rm
 
 -- ──────────────────────────────────────────────
 -- Mock mutation support
@@ -191,33 +191,33 @@ instance Show RecordedMutation where
 -- and mutations (from 'MutationHandlers'), recording all mutations
 -- for assertions.
 -- | @m@ is a phantom type representing the source monad (for instance selection).
-newtype MockMutateT (m :: Type -> Type) n a = MockMutateT
-  { unMockMutateT :: ResultMap -> MutationHandlers -> IORef [RecordedMutation] -> n a }
+newtype MockMutate (m :: Type -> Type) n a = MockMutate
+  { unMockMutate :: ResultMap -> MutationHandlers -> IORef [RecordedMutation] -> n a }
 
-instance Functor n => Functor (MockMutateT m n) where
-  fmap f (MockMutateT g) = MockMutateT $ \rm mh ref -> fmap f (g rm mh ref)
+instance Functor n => Functor (MockMutate m n) where
+  fmap f (MockMutate g) = MockMutate $ \rm mh ref -> fmap f (g rm mh ref)
 
-instance Applicative n => Applicative (MockMutateT m n) where
-  pure a = MockMutateT $ \_ _ _ -> pure a
-  MockMutateT ff <*> MockMutateT fx = MockMutateT $ \rm mh ref ->
+instance Applicative n => Applicative (MockMutate m n) where
+  pure a = MockMutate $ \_ _ _ -> pure a
+  MockMutate ff <*> MockMutate fx = MockMutate $ \rm mh ref ->
     ff rm mh ref <*> fx rm mh ref
 
-instance Monad n => Monad (MockMutateT m n) where
-  MockMutateT ma >>= f = MockMutateT $ \rm mh ref -> do
+instance Monad n => Monad (MockMutate m n) where
+  MockMutate ma >>= f = MockMutate $ \rm mh ref -> do
     a <- ma rm mh ref
-    unMockMutateT (f a) rm mh ref
+    unMockMutate (f a) rm mh ref
 
-instance (Monad n, n ~ IO) => MonadFetch m (MockMutateT m n) where
-  fetch k = MockMutateT $ \rm _ _ ->
+instance (Monad n, n ~ IO) => MonadFetch m (MockMutate m n) where
+  fetch k = MockMutate $ \rm _ _ ->
     case lookupMock rm k of
       Right v -> pure v
       Left ex -> throwIO ex
-  tryFetch k = MockMutateT $ \rm _ _ ->
+  tryFetch k = MockMutate $ \rm _ _ ->
     pure (lookupMock rm k)
   primeCache _ _ = pure ()
 
-instance (Monad n, n ~ IO) => MonadMutate m (MockMutateT m n) where
-  mutate k = MockMutateT $ \_ mh ref ->
+instance (Monad n, n ~ IO) => MonadMutate m (MockMutate m n) where
+  mutate k = MockMutate $ \_ mh ref ->
     case lookupMutationHandler mh k of
       Right v -> do
         let tr = SomeTypeRep (typeOf k)
@@ -226,7 +226,7 @@ instance (Monad n, n ~ IO) => MonadMutate m (MockMutateT m n) where
         pure v
       Left ex -> throwIO ex
 
-  tryMutate k = MockMutateT $ \_ mh ref -> do
+  tryMutate k = MockMutate $ \_ mh ref -> do
     result <- try $ evaluate $ lookupMutationHandler mh k
     case result of
       Right (Right v) -> do
@@ -237,15 +237,15 @@ instance (Monad n, n ~ IO) => MonadMutate m (MockMutateT m n) where
       Right (Left ex) -> pure (Left ex)
       Left ex -> pure (Left ex)
 
-instance MonadFail n => MonadFail (MockMutateT m n) where
-  fail msg = MockMutateT $ \_ _ _ -> fail msg
+instance MonadFail n => MonadFail (MockMutate m n) where
+  fail msg = MockMutate $ \_ _ _ -> fail msg
 
-instance MonadThrow n => MonadThrow (MockMutateT m n) where
-  throwM e = MockMutateT $ \_ _ _ -> throwM e
+instance MonadThrow n => MonadThrow (MockMutate m n) where
+  throwM e = MockMutate $ \_ _ _ -> throwM e
 
-instance MonadCatch n => MonadCatch (MockMutateT m n) where
-  catch (MockMutateT f) handler = MockMutateT $ \rm mh ref ->
-    catch (f rm mh ref) (\e -> unMockMutateT (handler e) rm mh ref)
+instance MonadCatch n => MonadCatch (MockMutate m n) where
+  catch (MockMutate f) handler = MockMutate $ \rm mh ref ->
+    catch (f rm mh ref) (\e -> unMockMutate (handler e) rm mh ref)
 
 -- | Run a computation against mock data and mutation handlers.
 -- Returns the result and a list of recorded mutations.
@@ -253,11 +253,11 @@ instance MonadCatch n => MonadCatch (MockMutateT m n) where
 -- @
 -- let mocks = mockData \@UserId [(UserId 1, User 1 "alice")]
 --     handlers = mockMutation \@UpdateUser (\\(UpdateUser uid name) -> User uid name)
--- (result, mutations) <- runMockMutateT \@AppM mocks handlers myAction
+-- (result, mutations) <- runMockMutate \@AppM mocks handlers myAction
 -- length mutations \`shouldBe\` 1
 -- @
-runMockMutateT :: ResultMap -> MutationHandlers -> MockMutateT m IO a -> IO (a, [RecordedMutation])
-runMockMutateT rm mh (MockMutateT f) = do
+runMockMutate :: ResultMap -> MutationHandlers -> MockMutate m IO a -> IO (a, [RecordedMutation])
+runMockMutate rm mh (MockMutate f) = do
   ref <- newIORef []
   a <- f rm mh ref
   mutations <- readIORef ref

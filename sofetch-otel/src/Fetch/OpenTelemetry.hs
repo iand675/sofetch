@@ -15,15 +15,15 @@
 -- import OpenTelemetry.Trace.Core (makeTracer, tracerOptions)
 --
 -- tracer <- makeTracer tracerProvider "sofetch" tracerOptions
--- result <- runFetchTWithOTel tracer id liftIO myFetchAction
+-- let cfg = fetchConfig id liftIO
+-- result <- runFetchWithOTel cfg tracer myFetchAction
 -- @
 module Fetch.OpenTelemetry
-  ( runFetchTWithOTel
-  , runFetchTWithCacheWithOTel
+  ( runFetchWithOTel
   ) where
 
 import Fetch
-  ( FetchT, FetchEnv(..)
+  ( Fetch, FetchConfig(..), FetchEnv(..)
   , CacheRef, newCacheRef
   , Batches, batchSourceCount, batchSize
   , RoundStats(..)
@@ -38,7 +38,7 @@ import OpenTelemetry.Trace.Core
   , addAttribute, inSpan'
   )
 
--- | Run a 'FetchT' computation with OpenTelemetry instrumentation.
+-- | Run a 'Fetch' computation with OpenTelemetry instrumentation.
 --
 -- Creates:
 --
@@ -59,30 +59,20 @@ import OpenTelemetry.Trace.Core
 -- * @sofetch.round.keys@: keys dispatched this round
 -- * @sofetch.round.cache_hits@: keys served from cache this round
 --
--- This variant takes two natural transformations to bridge @m@ and @IO@.
--- For @m ~ IO@, use @id@ for both.
-runFetchTWithOTel :: forall m a.
+-- To share a cache across runs, set @configCache = Just cRef@ on the
+-- 'FetchConfig'.
+runFetchWithOTel :: forall m a.
                      Monad m
-                  => Tracer
-                  -> (forall x. m x -> IO x)
-                  -> (forall x. IO x -> m x)
-                  -> FetchT m a
+                  => FetchConfig m
+                  -> Tracer
+                  -> Fetch m a
                   -> m a
-runFetchTWithOTel tracer lower lift action = do
-  cRef <- lift newCacheRef
-  runFetchTWithCacheWithOTel tracer lower lift cRef action
-
--- | Like 'runFetchTWithOTel' but with an externally managed 'CacheRef',
--- allowing cache sharing across multiple runs.
-runFetchTWithCacheWithOTel
-  :: forall m a. Monad m
-  => Tracer
-  -> (forall x. m x -> IO x)
-  -> (forall x. IO x -> m x)
-  -> CacheRef
-  -> FetchT m a
-  -> m a
-runFetchTWithCacheWithOTel tracer lower lift cRef action =
+runFetchWithOTel cfg tracer action = do
+  let lower = configLower cfg
+      lift  = configLift cfg
+  cRef <- case configCache cfg of
+    Just ref -> pure ref
+    Nothing  -> lift newCacheRef
   lift $ inSpan' tracer "sofetch.fetch" defaultSpanArguments { kind = Internal } $ \rootSpan -> do
     statsRef <- newIORef (0 :: Int, 0 :: Int, 0 :: Int)
 

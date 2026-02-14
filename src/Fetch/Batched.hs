@@ -8,11 +8,14 @@
 {-# LANGUAGE BangPatterns #-}
 
 module Fetch.Batched
-  ( FetchT(..)
+  ( Fetch(..)
+  , FetchConfig(..)
+  , fetchConfig
+  , fetchConfigIO
   , FetchEnv(..)
   , liftSource
-  , runFetchT
-  , runFetchTWithCache
+  , runFetch
+  , runFetch'
   , runLoop
   , runLoopWith
   ) where
@@ -24,9 +27,12 @@ import Fetch.Engine
 
 import Control.Exception (throwIO, toException)
 import Control.Monad.Catch (MonadThrow(..), MonadCatch(..))
+import Control.Monad.IO.Unlift (MonadUnliftIO(..), liftIO)
+import Data.Functor.Apply (Apply(..))
+import Data.Functor.Bind (Bind(..))
 import qualified Data.HashMap.Strict as HM
 
--- | The environment threaded through FetchT.
+-- | The environment threaded through Fetch.
 --
 -- Contains the cache and the two natural transformations that
 -- bridge the source monad @m@ with @IO@.
@@ -48,20 +54,20 @@ data FetchEnv m = FetchEnv
 -- 'DataSource' implementations run in.
 --
 -- Enable @ApplicativeDo@ for ergonomic batching in do-blocks.
-newtype FetchT m a = FetchT
-  { unFetchT :: FetchEnv m -> m (Status m (FetchT m) a) }
+newtype Fetch m a = Fetch
+  { unFetch :: FetchEnv m -> m (Status m (Fetch m) a) }
 
--- | Lift a source-monad action into 'FetchT'.
-liftSource :: Monad m => m a -> FetchT m a
-liftSource ma = FetchT $ \_ -> Done <$> ma
+-- | Lift a source-monad action into 'Fetch'.
+liftSource :: Monad m => m a -> Fetch m a
+liftSource ma = Fetch $ \_ -> Done <$> ma
 
-instance Functor m => Functor (FetchT m) where
-  fmap f (FetchT g) = FetchT $ \e -> fmap (fmap f) (g e)
+instance Functor m => Functor (Fetch m) where
+  fmap f (Fetch g) = Fetch $ \e -> fmap (fmap f) (g e)
 
-instance Monad m => Applicative (FetchT m) where
-  pure a = FetchT $ \_ -> pure (Done a)
+instance Monad m => Applicative (Fetch m) where
+  pure a = Fetch $ \_ -> pure (Done a)
 
-  FetchT ff <*> FetchT fx = FetchT $ \e -> do
+  Fetch ff <*> Fetch fx = Fetch $ \e -> do
     sf <- ff e
     sx <- fx e
     pure $ case (sf, sx) of
@@ -74,32 +80,96 @@ instance Monad m => Applicative (FetchT m) where
       (Blocked bs1 kf, Blocked bs2 kx) ->
         Blocked (bs1 <> bs2) (kf <*> kx)
 
-instance Monad m => Monad (FetchT m) where
-  FetchT ma >>= f = FetchT $ \e -> do
+instance Monad m => Monad (Fetch m) where
+  Fetch ma >>= f = Fetch $ \e -> do
     sa <- ma e
     case sa of
-      Done a       -> unFetchT (f a) e
+      Done a       -> unFetch (f a) e
       Blocked bs k -> pure $ Blocked bs (k >>= f)
 
-instance MonadFail m => MonadFail (FetchT m) where
+instance MonadFail m => MonadFail (Fetch m) where
   fail = liftSource . fail
 
 -- ──────────────────────────────────────────────
 -- MonadThrow / MonadCatch
 -- ──────────────────────────────────────────────
 
-instance MonadThrow m => MonadThrow (FetchT m) where
+instance MonadThrow m => MonadThrow (Fetch m) where
   throwM = liftSource . throwM
 
 -- | Propagates the handler through 'Blocked' continuations so that
 -- a @catch@ wrapping a multi-round computation catches exceptions
 -- thrown in any round, not just the initial probe.
-instance MonadCatch m => MonadCatch (FetchT m) where
-  catch (FetchT f) handler = FetchT $ \e -> do
-    status <- catch (f e) (\ex -> unFetchT (handler ex) e)
+instance MonadCatch m => MonadCatch (Fetch m) where
+  catch (Fetch f) handler = Fetch $ \e -> do
+    status <- catch (f e) (\ex -> unFetch (handler ex) e)
     case status of
       Done a       -> pure (Done a)
       Blocked bs k -> pure (Blocked bs (catch k handler))
+
+-- ──────────────────────────────────────────────
+-- Semigroup / Monoid (lifted)
+-- ──────────────────────────────────────────────
+
+-- | Combines two fetches applicatively, batching their pending keys.
+--
+-- @a <> b = liftA2 (<>) a b@
+instance (Monad m, Semigroup a) => Semigroup (Fetch m a) where
+  (<>) = liftA2 (<>)
+
+-- | @mempty = pure mempty@.
+instance (Monad m, Monoid a) => Monoid (Fetch m a) where
+  mempty = pure mempty
+
+-- ──────────────────────────────────────────────
+-- Semigroupoids (Apply / Bind)
+-- ──────────────────────────────────────────────
+
+-- | 'Apply' is 'Applicative' without 'pure'. Same batching semantics.
+instance Monad m => Apply (Fetch m) where
+  (<.>) = (<*>)
+
+-- | 'Bind' is 'Monad' without 'return'. Same round-boundary semantics.
+instance Monad m => Bind (Fetch m) where
+  (>>-) = (>>=)
+
+-- ──────────────────────────────────────────────
+-- Instances that are NOT provided (and why)
+-- ──────────────────────────────────────────────
+
+-- MonadTrans / MonadIO:
+--   Intentionally omitted. @lift@ / @liftIO@ would be equivalent to
+--   'liftSource', but having them available via the standard typeclasses
+--   makes it too easy to accidentally run source-monad actions during
+--   the probe phase — bypassing the batching system and potentially
+--   introducing writes outside of 'Mutate'\'s cache reconciliation.
+--   Use 'liftSource' when you explicitly need to lift an @m@ action.
+--
+-- MFunctor / hoist (mmorph):
+--   NOT possible. 'Batches m' carries existential @DataSource m k@
+--   constraints. Changing @m@ to @n@ requires re-proving those
+--   constraints for @n@, which cannot be done generically.
+--
+-- MonadReader r:
+--   'ask' would work via @lift ask@, but 'local' cannot propagate
+--   through batch dispatch. The 'fetchLower' nat in 'FetchEnv'
+--   captures the reader environment at the run site; 'local' inside
+--   a 'Fetch' computation would only affect the probe phase, not
+--   the 'batchFetch' calls dispatched by the engine. Providing a
+--   'MonadReader' instance with broken 'local' would violate the
+--   class laws, so we omit it entirely.
+--
+-- MonadBaseControl / MonadUnliftIO:
+--   NOT possible. 'Fetch' is continuation-based: a 'Blocked' status
+--   carries thunks that close over the 'FetchEnv' (which contains
+--   mutable 'CacheRef' state). There is no way to capture this as a
+--   pure @StM@ value and restore it.
+--
+-- MonadMask:
+--   Intentionally omitted. Async exception masking across batch
+--   round boundaries is not well-defined. A @mask@ would need to
+--   protect both the probe and all subsequent rounds, but rounds
+--   execute in IO via 'executeBatches' which uses 'async' internally.
 
 -- ──────────────────────────────────────────────
 -- Cache lookup helper
@@ -122,8 +192,8 @@ lookupOrAwait e k onMiss = do
 -- MonadFetch instance
 -- ──────────────────────────────────────────────
 
-instance Monad m => MonadFetch m (FetchT m) where
-  fetch (k :: k) = FetchT $ \e ->
+instance Monad m => MonadFetch m (Fetch m) where
+  fetch (k :: k) = Fetch $ \e ->
     -- NoCaching semantics: skip the cache check entirely and always
     -- return Blocked. This guarantees that every >>= round dispatches
     -- a fresh batch for this key. The engine's dispatchUncached uses
@@ -138,7 +208,7 @@ instance Monad m => MonadFetch m (FetchT m) where
       NoCaching ->
         pure $ Blocked
           (singletonBatch k)
-          (FetchT $ \e' -> do
+          (Fetch $ \e' -> do
             result <- lookupOrAwait e' k
               (fetchLift e' $ throwIO $ FetchError $
                 "Key not found in cache after round: " <> show k)
@@ -158,7 +228,7 @@ instance Monad m => MonadFetch m (FetchT m) where
           CacheMiss ->
             pure $ Blocked
               (singletonBatch k)
-              (FetchT $ \e' -> do
+              (Fetch $ \e' -> do
                 result <- lookupOrAwait e' k
                   (fetchLift e' $ throwIO $ FetchError $
                     "Key not found in cache after round: " <> show k)
@@ -166,13 +236,13 @@ instance Monad m => MonadFetch m (FetchT m) where
                   Right v -> pure (Done v)
                   Left ex -> fetchLift e' $ throwIO ex)
 
-  tryFetch (k :: k) = FetchT $ \e ->
+  tryFetch (k :: k) = Fetch $ \e ->
     -- See 'fetch' above for NoCaching semantics.
     case cachePolicy @m @k Proxy of
       NoCaching ->
         pure $ Blocked
           (singletonBatch k)
-          (FetchT $ \e' -> do
+          (Fetch $ \e' -> do
             result <- lookupOrAwait e' k
               (pure $ Left $ toException $
                 FetchError $ "Key not found in cache after round: " <> show k)
@@ -187,13 +257,13 @@ instance Monad m => MonadFetch m (FetchT m) where
           CacheMiss ->
             pure $ Blocked
               (singletonBatch k)
-              (FetchT $ \e' -> do
+              (Fetch $ \e' -> do
                 result <- lookupOrAwait e' k
                   (pure $ Left $ toException $
                     FetchError $ "Key not found in cache after round: " <> show k)
                 pure (Done result))
 
-  primeCache k v = FetchT $ \e -> do
+  primeCache k v = Fetch $ \e -> do
     let cRef = fetchCache e
     hit <- fetchLift e $ cacheLookup cRef k
     case hit of
@@ -205,62 +275,131 @@ instance Monad m => MonadFetch m (FetchT m) where
 -- MonadFetchBatch instance
 -- ──────────────────────────────────────────────
 
-instance Monad m => MonadFetchBatch m (FetchT m) where
-  probe m = FetchT $ \e -> do
-    s <- unFetchT m e
+instance Monad m => MonadFetchBatch m (Fetch m) where
+  probe m = Fetch $ \e -> do
+    s <- unFetch m e
     pure (Done s)
 
   embed (Done a)      = pure a
   embed (Blocked _ k) = k
 
 -- ──────────────────────────────────────────────
+-- Config
+-- ──────────────────────────────────────────────
+
+-- | Configuration for running a 'Fetch' computation.
+--
+-- Contains the two natural transformations that bridge the source
+-- monad @m@ with @IO@, plus optional settings. Use 'fetchConfig'
+-- to construct with sensible defaults, then override fields as needed:
+--
+-- @
+-- let cfg = fetchConfig (runAppM env) liftIO
+-- runFetch cfg action
+--
+-- -- with a shared cache:
+-- runFetch cfg { configCache = Just myCache } action
+-- @
+--
+-- For monads that deliberately avoid 'MonadIO' (e.g. a @Transaction@
+-- type), the nats are the private escape hatches:
+--
+-- @
+-- fetchInTransaction :: Fetch Transaction a -> Transaction a
+-- fetchInTransaction = runFetch (fetchConfig unsafeRunTransaction unsafeLiftIO)
+-- @
+data FetchConfig m = FetchConfig
+  { configLower :: !(forall x. m x -> IO x)
+    -- ^ Run an @m@ action in @IO@. Used by the engine to dispatch
+    -- @batchFetch@ calls.
+  , configLift  :: !(forall x. IO x -> m x)
+    -- ^ Lift an @IO@ action into @m@. Used for cache and IVar
+    -- operations within @m@.
+  , configCache :: !(Maybe CacheRef)
+    -- ^ Pre-existing cache. 'Nothing' creates a fresh cache per run.
+    -- Set to @Just cRef@ to share or pre-warm a cache.
+  }
+
+-- | Construct a 'FetchConfig' with explicit natural transformations.
+--
+-- Use this for monads that don't have 'MonadUnliftIO' (e.g. a
+-- restricted @Transaction@ type). For 'MonadUnliftIO' monads,
+-- prefer 'fetchConfigIO' which fills in the nats automatically.
+fetchConfig :: (forall x. m x -> IO x)
+            -> (forall x. IO x -> m x)
+            -> FetchConfig m
+fetchConfig lower lift = FetchConfig
+  { configLower = lower
+  , configLift  = lift
+  , configCache = Nothing
+  }
+
+-- | Construct a 'FetchConfig' for any 'MonadUnliftIO' monad.
+--
+-- The natural transformations are derived from the 'MonadUnliftIO'
+-- instance: 'withRunInIO' provides @m x -> IO x@, and 'liftIO'
+-- provides @IO x -> m x@.
+--
+-- @
+-- cfg <- fetchConfigIO
+-- runFetch cfg action
+-- @
+fetchConfigIO :: MonadUnliftIO m => m (FetchConfig m)
+fetchConfigIO = withRunInIO $ \runInIO ->
+  pure FetchConfig
+    { configLower = runInIO
+    , configLift  = liftIO
+    , configCache = Nothing
+    }
+
+-- ──────────────────────────────────────────────
 -- Runners
 -- ──────────────────────────────────────────────
 
--- | Run a 'FetchT' computation.
---
--- Takes two natural transformations:
---
--- * @lower@: @m x -> IO x@. Runs source-monad actions in IO.
--- * @lift@: @IO x -> m x@. Lifts IO actions into the source monad.
---
--- Returns in the source monad @m@.
---
--- For libraries that use a restricted monad (e.g. @Transaction@)
--- without @MonadIO@ / @MonadUnliftIO@, these nats are the escape
--- hatch:
+-- | Run a 'Fetch' computation.
 --
 -- @
--- fetchInTransaction :: FetchT Transaction a -> Transaction a
--- fetchInTransaction = runFetchT unsafeRunTransaction unsafeLiftIO
+-- let cfg = fetchConfig (runAppM env) liftIO
+-- result <- runFetch cfg action
 -- @
-runFetchT :: Monad m
-          => (forall x. m x -> IO x)
-          -> (forall x. IO x -> m x)
-          -> FetchT m a
-          -> m a
-runFetchT lower lift action = do
-  cacheRef <- lift newCacheRef
-  runFetchTWithCache lower lift cacheRef action
-
--- | Run with an externally-provided cache. Useful for:
 --
--- * Sharing cache across sequential phases of request processing
--- * Pre-warming the cache before running
--- * Inspecting cache contents after running
-runFetchTWithCache :: Monad m
-                   => (forall x. m x -> IO x)
-                   -> (forall x. IO x -> m x)
-                   -> CacheRef
-                   -> FetchT m a
-                   -> m a
-runFetchTWithCache lower lift cacheRef action = do
+-- To share a cache across sequential phases:
+--
+-- @
+-- let cfg = (fetchConfig lower lift) { configCache = Just myCache }
+-- runFetch cfg action
+-- @
+runFetch :: Monad m => FetchConfig m -> Fetch m a -> m a
+runFetch cfg action = do
+  cacheRef <- case configCache cfg of
+    Just ref -> pure ref
+    Nothing  -> configLift cfg newCacheRef
   let e = FetchEnv
         { fetchCache = cacheRef
-        , fetchLower = lower
-        , fetchLift  = lift
+        , fetchLower = configLower cfg
+        , fetchLift  = configLift cfg
         }
   runLoop e (\_ _ -> pure ()) action
+
+-- | Like 'runFetch', but also returns the 'CacheRef'.
+-- This is the @runStateT@-style variant for cache preservation:
+--
+-- @
+-- (result1, cache) <- runFetch' cfg phase1
+-- result2 <- runFetch cfg { configCache = Just cache } phase2
+-- @
+runFetch' :: Monad m => FetchConfig m -> Fetch m a -> m (a, CacheRef)
+runFetch' cfg action = do
+  cacheRef <- case configCache cfg of
+    Just ref -> pure ref
+    Nothing  -> configLift cfg newCacheRef
+  let e = FetchEnv
+        { fetchCache = cacheRef
+        , fetchLower = configLower cfg
+        , fetchLift  = configLift cfg
+        }
+  a <- runLoop e (\_ _ -> pure ()) action
+  pure (a, cacheRef)
 
 -- | Generalised execution loop with a per-round wrapper.
 --
@@ -285,12 +424,12 @@ runLoopWith :: Monad m
             => FetchEnv m
             -> (Int -> Batches m -> m RoundStats -> m ())
                -- ^ Round wrapper. Must invoke the @m RoundStats@ action.
-            -> FetchT m a
+            -> Fetch m a
             -> m a
 runLoopWith e withRound = go 1
   where
     go !n m = do
-      status <- unFetchT m e
+      status <- unFetch m e
       case status of
         Done a -> pure a
         Blocked batches k -> do
@@ -309,7 +448,7 @@ runLoop :: Monad m
         => FetchEnv m
         -> (Int -> Batches m -> m ())
            -- ^ Called before each round with round number and batches.
-        -> FetchT m a
+        -> Fetch m a
         -> m a
 runLoop e onRound = runLoopWith e $ \n batches exec -> do
   onRound n batches

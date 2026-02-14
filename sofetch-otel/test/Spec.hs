@@ -131,14 +131,14 @@ main = hspec $ describe "Fetch.OpenTelemetry" $ do
     env <- mkTestEnv
     tracer <- mkNoopTracer
     result <- runTestM env $
-      runFetchTWithOTel tracer (runTestM env) testLiftIO $ fetch (UserId 1)
+      runFetchWithOTel (fetchConfig (runTestM env) testLiftIO) tracer $ fetch (UserId 1)
     result `shouldBe` "Alice"
 
   it "applicative batching works" $ do
     env <- mkTestEnv
     tracer <- mkNoopTracer
     (a, b) <- runTestM env $
-      runFetchTWithOTel tracer (runTestM env) testLiftIO $
+      runFetchWithOTel (fetchConfig (runTestM env) testLiftIO) tracer $
         (,) <$> fetch (UserId 1) <*> fetch (UserId 2)
     a `shouldBe` "Alice"
     b `shouldBe` "Bob"
@@ -149,7 +149,7 @@ main = hspec $ describe "Fetch.OpenTelemetry" $ do
     env <- mkTestEnv
     tracer <- mkNoopTracer
     _ <- runTestM env $
-      runFetchTWithOTel tracer (runTestM env) testLiftIO $ do
+      runFetchWithOTel (fetchConfig (runTestM env) testLiftIO) tracer $ do
         _ <- fetch (UserId 1)
         fetch (UserId 2)
     batches <- readIORef (envUserLog env)
@@ -159,7 +159,7 @@ main = hspec $ describe "Fetch.OpenTelemetry" $ do
     env <- mkTestEnv
     tracer <- mkNoopTracer
     (user, post) <- runTestM env $
-      runFetchTWithOTel tracer (runTestM env) testLiftIO $
+      runFetchWithOTel (fetchConfig (runTestM env) testLiftIO) tracer $
         (,) <$> fetch (UserId 1) <*> fetch (PostId 10)
     user `shouldBe` "Alice"
     post `shouldBe` "Hello World"
@@ -168,7 +168,7 @@ main = hspec $ describe "Fetch.OpenTelemetry" $ do
     env <- mkTestEnv
     tracer <- mkNoopTracer
     result <- runTestM env $
-      runFetchTWithOTel tracer (runTestM env) testLiftIO $ tryFetch (UserId 999)
+      runFetchWithOTel (fetchConfig (runTestM env) testLiftIO) tracer $ tryFetch (UserId 999)
     case result of
       Left _  -> pure ()
       Right _ -> expectationFailure "Expected Left for missing key"
@@ -177,19 +177,19 @@ main = hspec $ describe "Fetch.OpenTelemetry" $ do
     env <- mkTestEnv
     tracer <- mkNoopTracer
     result <- runTestM env $
-      runFetchTWithOTel tracer (runTestM env) testLiftIO $ tryFetch (FailKey 1)
+      runFetchWithOTel (fetchConfig (runTestM env) testLiftIO) tracer $ tryFetch (FailKey 1)
     case result of
       Left _  -> pure ()
       Right _ -> expectationFailure "Expected Left for failed source"
 
-  it "runFetchTWithCacheWithOTel shares cache across runs" $ do
+  it "shared cache across runs via configCache" $ do
     env <- mkTestEnv
     tracer <- mkNoopTracer
     cRef <- newCacheRef
     _ <- runTestM env $
-      runFetchTWithCacheWithOTel tracer (runTestM env) testLiftIO cRef $ fetch (UserId 1)
+      runFetchWithOTel ((fetchConfig (runTestM env) testLiftIO) { configCache = Just cRef }) tracer $ fetch (UserId 1)
     _ <- runTestM env $
-      runFetchTWithCacheWithOTel tracer (runTestM env) testLiftIO cRef $ fetch (UserId 1)
+      runFetchWithOTel ((fetchConfig (runTestM env) testLiftIO) { configCache = Just cRef }) tracer $ fetch (UserId 1)
     batches <- readIORef (envUserLog env)
     length batches `shouldBe` 1
 
@@ -198,10 +198,10 @@ main = hspec $ describe "Fetch.OpenTelemetry" $ do
     tracer <- mkNoopTracer
     cRef <- newCacheRef
     _ <- runTestM env $
-      runFetchTWithCacheWithOTel tracer (runTestM env) testLiftIO cRef $ do
+      runFetchWithOTel ((fetchConfig (runTestM env) testLiftIO) { configCache = Just cRef }) tracer $ do
         primeCache (UserId 1) "OTel-Seeded"
     result <- runTestM env $
-      runFetchTWithCacheWithOTel tracer (runTestM env) testLiftIO cRef $ fetch (UserId 1)
+      runFetchWithOTel ((fetchConfig (runTestM env) testLiftIO) { configCache = Just cRef }) tracer $ fetch (UserId 1)
     result `shouldBe` "OTel-Seeded"
     batches <- readIORef (envUserLog env)
     length batches `shouldBe` 0

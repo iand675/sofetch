@@ -352,7 +352,7 @@ instance DataSource DB PostsByAuthor where
 
 -- ── The SAFE public runner ──────────────────
 
--- | Run a FetchT computation inside the restricted DB monad.
+-- | Run a Fetch computation inside the restricted DB monad.
 --
 -- This is the ONLY function your module exports. The unsafe nats
 -- (unsafeRunDB, unsafeLiftIODB) stay private. Application code
@@ -361,12 +361,12 @@ instance DataSource DB PostsByAuthor where
 -- This is the pattern from the sofetch docs:
 --
 -- @
--- fetchInTransaction :: FetchT Transaction a -> Transaction a
--- fetchInTransaction = runFetchT unsafeRunTransaction unsafeLiftIO
+-- fetchInTransaction :: Fetch Transaction a -> Transaction a
+-- fetchInTransaction = runFetchIO unsafeRunTransaction unsafeLiftIO
 -- @
-fetchInDB :: FetchT DB a -> DB a
+fetchInDB :: Fetch DB a -> DB a
 fetchInDB action = DB $ \conn ->
-  unsafeRunDB conn $ runFetchT (unsafeRunDB conn) unsafeLiftIODB action
+  unsafeRunDB conn $ runFetch (fetchConfig (unsafeRunDB conn) unsafeLiftIODB) action
 
 -- ══════════════════════════════════════════════
 -- Polymorphic data-access functions
@@ -433,7 +433,7 @@ buildSearchResults = traverse buildSearchCard
 -- ──────────────────────────────────────────────
 
 -- | Fetch a user and their posts. Polymorphic over the fetch monad,
--- so it works with both FetchT (production) and MockFetchT (tests).
+-- so it works with both Fetch (production) and MockFetch (tests).
 getUserFeed
   :: ( MonadFetch m n
      , DataSource m UserById
@@ -562,10 +562,10 @@ setupDatabase conn = do
 -- Instrumented runner
 -- ══════════════════════════════════════════════
 
--- | Run a FetchT computation with detailed round-by-round logging.
+-- | Run a Fetch computation with detailed round-by-round logging.
 -- Shows round boundaries, key counts, sources dispatched, and cache hits.
-runFetch :: Connection -> FetchT AppM a -> IO a
-runFetch conn action = do
+runFetchIO :: Connection -> Fetch AppM a -> IO a
+runFetchIO conn action = do
   cRef <- newCacheRef
   totalRoundsRef <- newIORef (0 :: Int)
   totalKeysRef   <- newIORef (0 :: Int)
@@ -606,10 +606,10 @@ runFetch conn action = do
     <> show hits <> " cache hit(s)"
   pure a
 
--- | Like 'runFetch' but with an externally-provided cache.
+-- | Like 'runFetchIO' but with an externally-provided cache.
 -- Useful for sharing cache across multiple computations.
-runFetchWithCache :: Connection -> CacheRef -> FetchT AppM a -> IO a
-runFetchWithCache conn cRef action = do
+runFetchIOWithCache :: Connection -> CacheRef -> Fetch AppM a -> IO a
+runFetchIOWithCache conn cRef action = do
   let e = FetchEnv
         { fetchCache = cRef
         , fetchLower = runAppM conn
@@ -653,13 +653,13 @@ main = do
   -- ── Scenario 1: Single fetch ──────────────────
   header "1" "Single fetch"
   putStrLn "Fetching a single user by ID."
-  user <- runFetch conn $ fetch (UserById 1)
+  user <- runFetchIO conn $ fetch (UserById 1)
   putStrLn $ "  => " <> show user
 
   -- ── Scenario 2: Applicative batching ──────────
   header "2" "Applicative batching (two sources, one round)"
   putStrLn "Fetching a user AND their posts in one round (two different sources)."
-  (u, ps) <- runFetch conn $
+  (u, ps) <- runFetchIO conn $
     (,) <$> fetch (UserById 1) <*> fetch (PostsByAuthor 1)
   putStrLn $ "  => User: " <> show (userName u)
   putStrLn $ "  => Posts: " <> show (map postTitle ps)
@@ -667,7 +667,7 @@ main = do
   -- ── Scenario 3: Monadic dependency ────────────
   header "3" "Monadic dependency (2 rounds)"
   putStrLn "Fetching a post, THEN its author (data dependency forces 2 rounds)."
-  (post, author) <- runFetch conn $ do
+  (post, author) <- runFetchIO conn $ do
     p <- fetch (PostById 3)                   -- round 1
     a <- fetch (UserById (postAuthorId p))    -- round 2 (depends on post)
     pure (p, a)
@@ -678,7 +678,7 @@ main = do
   header "4" "N+1 avoidance"
   putStrLn "Fetching Alice's posts, then ALL comments for those posts in ONE batch."
   putStrLn "(Without sofetch, this would be N separate queries.)"
-  allComments <- runFetch conn $ do
+  allComments <- runFetchIO conn $ do
     posts <- fetch (PostsByAuthor 1)                         -- round 1
     fetchAll (map (CommentsByPost . postId) posts)           -- round 2: ONE batch
   putStrLn $ "  => Comment counts per post: " <> show (map length allComments)
@@ -687,7 +687,7 @@ main = do
   header "5" "Deduplication"
   putStrLn "Fetching comments on posts 1 and 2. Bob (id=2) commented on both."
   putStrLn "His user record should only be fetched ONCE."
-  authors <- runFetch conn $ do
+  authors <- runFetchIO conn $ do
     -- Round 1: both comment fetches batch into ONE SQL query
     (c1, c2) <- (,) <$> fetch (CommentsByPost 1) <*> fetch (CommentsByPost 2)
     -- Round 2: author IDs are deduplicated — Bob only fetched once
@@ -700,7 +700,7 @@ main = do
   -- ── Scenario 6: Combinators ──────────────────
   header "6" "Combinators (fetchThrough, fetchMap)"
   putStrLn "Using fetchThrough to enrich comments with their authors:"
-  enriched <- runFetch conn $ do
+  enriched <- runFetchIO conn $ do
     comments <- fetch (CommentsByPost 1)
     fetchThrough (UserById . commentAuthorId) comments
   mapM_ (\(c, author') -> putStrLn $ "  => " <> T.unpack (commentBody c)
@@ -708,7 +708,7 @@ main = do
 
   putStrLn ""
   putStrLn "Using fetchMap to get (title, authorName) from post IDs:"
-  results <- runFetch conn $
+  results <- runFetchIO conn $
     fetchMap PostById (\_ p -> (postTitle p, postAuthorId p)) [1, 3, 5]
   mapM_ (\(title, aid) -> putStrLn $ "  => \"" <> T.unpack title
     <> "\" (author_id=" <> show aid <> ")") results
@@ -721,30 +721,30 @@ main = do
   -- First computation: fills the cache
   putStrLn ""
   putStrLn "  First computation (cold cache) -- requesting UserById 1, 2:"
-  _ <- runFetchWithCache conn cRef $
+  _ <- runFetchIOWithCache conn cRef $
     (,) <$> fetch (UserById 1) <*> fetch (UserById 2)
   -- Second computation: same cache
   putStrLn ""
   putStrLn "  Second computation (warm cache) -- requesting UserById 1, 2, 3:"
   putStrLn "  Users 1 and 2 resolve instantly from cache. Only user 3 hits SQL."
-  _ <- runFetchWithCache conn cRef $
+  _ <- runFetchIOWithCache conn cRef $
     (,,) <$> fetch (UserById 1) <*> fetch (UserById 2) <*> fetch (UserById 3)
   pure ()
 
-  -- ── Scenario 8: MockFetchT ────────────────────
-  header "8" "MockFetchT (same code, no database)"
+  -- ── Scenario 8: MockFetch ────────────────────
+  header "8" "MockFetch (same code, no database)"
   putStrLn "Running getUserFeed against REAL SQLite:"
-  realResult <- runFetch conn $ getUserFeed 1
+  realResult <- runFetchIO conn $ getUserFeed 1
   putStrLn $ "  => " <> show (userName (fst realResult))
     <> ", " <> show (length (snd realResult)) <> " posts"
 
   putStrLn ""
-  putStrLn "Running the EXACT SAME function against MockFetchT (canned data):"
+  putStrLn "Running the EXACT SAME function against MockFetch (canned data):"
   let mockUser = User 1 "Mock Alice"
       mockPosts = [Post 99 1 "Mock Post" "This is fake data"]
       mocks = mockData @UserById [(UserById 1, mockUser)]
            <> mockData @PostsByAuthor [(PostsByAuthor 1, mockPosts)]
-  mockResult <- runMockFetchT @AppM mocks (getUserFeed 1)
+  mockResult <- runMockFetch @AppM mocks (getUserFeed 1)
   putStrLn $ "  => " <> show (userName (fst mockResult))
     <> ", " <> show (length (snd mockResult)) <> " posts"
 
@@ -757,7 +757,7 @@ main = do
   putStrLn "In a for-loop world this would be dozens of queries."
   putStrLn "With sofetch, each depth level batches into ONE round:"
   putStrLn ""
-  profiles <- runFetch conn $ renderBlogPage [1, 2, 3]
+  profiles <- runFetchIO conn $ renderBlogPage [1, 2, 3]
   putStrLn ""
   putStrLn "  Results:"
   mapM_ (\(authorName', postSummaries) -> do
@@ -773,7 +773,7 @@ main = do
   putStrLn "Fetching 200 users at once. The UserByIdChunked data source"
   putStrLn "splits the IN clause into chunks of 50 to avoid oversized SQL."
   putStrLn ""
-  users200 <- runFetch conn $
+  users200 <- runFetchIO conn $
     fetchAll (map UserByIdChunked [1..200])
   putStrLn $ "  => Fetched " <> show (length users200) <> " users"
   putStrLn $ "  => First: " <> show (take 1 users200)
@@ -791,7 +791,7 @@ main = do
   putStrLn "  Round 1: all PostById + CommentCountByPost + LatestCommentByPost"
   putStrLn "  Round 2: all UserById (depends on author_id from round 1)"
   putStrLn ""
-  cards <- runFetch conn $ buildSearchResults [1, 2, 3, 5, 8]
+  cards <- runFetchIO conn $ buildSearchResults [1, 2, 3, 5, 8]
   putStrLn ""
   putStrLn "  Results:"
   mapM_ (\c -> putStrLn $ "  \"" <> T.unpack (cardTitle c) <> "\""
@@ -810,7 +810,7 @@ main = do
   putStrLn ""
 
   -- getUserFeed is polymorphic: (MonadFetch m n, DataSource m UserById, ...)
-  -- It works with both AppM (via runFetch) and DB (via fetchInDB).
+  -- It works with both AppM (via runFetchIO) and DB (via fetchInDB).
   let runDB :: DB a -> IO a
       runDB act = unsafeRunDB conn act
 

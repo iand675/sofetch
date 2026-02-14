@@ -50,7 +50,7 @@ module Fetch.Combinators
   ) where
 
 import Fetch.Class
-import Fetch.Batched (FetchT(..))
+import Fetch.Batched (Fetch(..))
 
 import Control.Monad.Catch (MonadCatch, catch)
 import Data.Foldable (toList)
@@ -151,7 +151,7 @@ ma .|| mb = do a <- ma; if a then pure True else mb
 -- Applicative pairing
 -- ──────────────────────────────────────────────
 
--- | Pair two applicative computations. When used with 'FetchT',
+-- | Pair two applicative computations. When used with 'Fetch',
 -- both sides are batched into the same round.
 --
 -- @pair (fetch userKey) (fetch postKey)@
@@ -178,14 +178,14 @@ infixr 4 `pOr`
 --
 -- This is the fundamental building block for 'pAnd' and 'pOr'.
 biselect :: Monad m
-         => FetchT m (Either a b)
-         -> FetchT m (Either a c)
-         -> FetchT m (Either a (b, c))
+         => Fetch m (Either a b)
+         -> Fetch m (Either a c)
+         -> Fetch m (Either a (b, c))
 biselect = go
   where
-    go l r = FetchT $ \e -> do
-      sl <- unFetchT l e
-      sr <- unFetchT r e
+    go l r = Fetch $ \e -> do
+      sl <- unFetch l e
+      sr <- unFetch r e
       pure $ case (sl, sr) of
         -- Either side short-circuits
         (Done (Left a), _)                -> Done (Left a)
@@ -200,16 +200,16 @@ biselect = go
         (Blocked bs1 kl, Blocked bs2 kr)  -> Blocked (bs1 <> bs2) (go kl kr)
 
     -- Left resolved to @Right b@; keep probing right for early exit.
-    goRight b r = FetchT $ \e -> do
-      sr <- unFetchT r e
+    goRight b r = Fetch $ \e -> do
+      sr <- unFetch r e
       pure $ case sr of
         Done (Left a)    -> Done (Left a)
         Done (Right c)   -> Done (Right (b, c))
         Blocked bs kr    -> Blocked bs (goRight b kr)
 
     -- Right resolved to @Right c@; keep probing left for early exit.
-    goLeft l c = FetchT $ \e -> do
-      sl <- unFetchT l e
+    goLeft l c = Fetch $ \e -> do
+      sl <- unFetch l e
       pure $ case sl of
         Done (Left a)    -> Done (Left a)
         Done (Right b)   -> Done (Right (b, c))
@@ -227,7 +227,7 @@ biselect = go
 -- @
 -- pAnd (fetch (IsActive uid)) (fetch (HasPermission uid "admin"))
 -- @
-pAnd :: Monad m => FetchT m Bool -> FetchT m Bool -> FetchT m Bool
+pAnd :: Monad m => Fetch m Bool -> Fetch m Bool -> Fetch m Bool
 pAnd x y = fromEither <$> biselect (discrim <$> x) (discrim <$> y)
   where
     discrim False = Left False  -- short-circuit
@@ -247,7 +247,7 @@ pAnd x y = fromEither <$> biselect (discrim <$> x) (discrim <$> y)
 -- @
 -- pOr (fetch (IsAdmin uid)) (fetch (IsModerator uid))
 -- @
-pOr :: Monad m => FetchT m Bool -> FetchT m Bool -> FetchT m Bool
+pOr :: Monad m => Fetch m Bool -> Fetch m Bool -> Fetch m Bool
 pOr x y = fromEither <$> biselect (discrim <$> x) (discrim <$> y)
   where
     discrim True  = Left True   -- short-circuit

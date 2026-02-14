@@ -14,7 +14,7 @@
 module Main (main) where
 
 import Fetch
-import Fetch.Batched (FetchT(..))
+import Fetch.Batched (Fetch(..))
 import Fetch.Class (singletonBatch, batchKeys)
 import Fetch.Combinators (biselect, pAnd, pOr)
 import Fetch.IVar
@@ -327,16 +327,16 @@ instance DataSource TestM BlockingKey where
 -- Helpers
 -- ══════════════════════════════════════════════
 
--- | Run a FetchT computation over TestM in IO.
-runTest :: TestEnv -> FetchT TestM a -> IO a
-runTest env = runTestM env . runFetchT (runTestM env) testLiftIO
+-- | Run a Fetch computation over TestM in IO.
+runTest :: TestEnv -> Fetch TestM a -> IO a
+runTest env = runTestM env . runFetch (fetchConfig (runTestM env) testLiftIO)
 
--- | Run a FetchT computation with an externally-provided cache.
-runTestWithCache :: TestEnv -> CacheRef -> FetchT TestM a -> IO a
-runTestWithCache env cRef = runTestM env . runFetchTWithCache (runTestM env) testLiftIO cRef
+-- | Run a Fetch computation with an externally-provided cache.
+runTestWithCache :: TestEnv -> CacheRef -> Fetch TestM a -> IO a
+runTestWithCache env cRef = runTestM env . runFetch ((fetchConfig (runTestM env) testLiftIO) { configCache = Just cRef })
 
--- | Run a FetchT computation and capture per-round (roundNumber, batchSize, sourceCount).
-runTestWithRoundLog :: TestEnv -> FetchT TestM a -> IO (a, [(Int, Int, Int)])
+-- | Run a Fetch computation and capture per-round (roundNumber, batchSize, sourceCount).
+runTestWithRoundLog :: TestEnv -> Fetch TestM a -> IO (a, [(Int, Int, Int)])
 runTestWithRoundLog env action = do
   logRef <- newIORef ([] :: [(Int, Int, Int)])
   cRef <- newCacheRef
@@ -720,7 +720,7 @@ batchesSpec = describe "Fetch.Class Batches" $ do
     keys `shouldBe` []
 
 -- ══════════════════════════════════════════════
--- FetchT / Batched tests
+-- Fetch / Batched tests
 -- ══════════════════════════════════════════════
 
 batchedSpec :: Spec
@@ -799,7 +799,7 @@ batchedSpec = describe "Fetch.Batched" $ do
     length userBatches `shouldBe` 1
     length postBatches `shouldBe` 1
 
-  it "runFetchTWithCache shares cache across runs" $ do
+  it "runFetchWithCache shares cache across runs" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
     _ <- runTestWithCache env cRef $ fetch (UserId 1)
@@ -917,9 +917,9 @@ primeCacheSpec = describe "MonadFetch.primeCache" $ do
       fetch (UserId 1)                -- should return the primed value
     result `shouldBe` "Updated"
 
-  it "is a no-op in MockFetchT" $ do
+  it "is a no-op in MockFetch" $ do
     let mocks = mockData @UserId [(UserId 1, "Alice")]
-    result <- runMockFetchT @TestM mocks $ do
+    result <- runMockFetch @TestM mocks $ do
       primeCache (UserId 2) "Ghost"
       fetch (UserId 1)
     result `shouldBe` "Alice"
@@ -947,10 +947,10 @@ primeCacheSpec = describe "MonadFetch.primeCache" $ do
     batches <- readIORef (envUserLog env)
     length batches `shouldBe` 0
 
-  it "primeCache works through TracedFetchT" $ do
+  it "primeCache works through TracedFetch" $ do
     env <- mkTestEnv
     (result, _) <- runTestM env $
-      runTracedFetchT (runTestM env) testLiftIO defaultTraceConfig $ do
+      runTracedFetch (fetchConfig (runTestM env) testLiftIO) defaultTraceConfig $ do
         primeCache (UserId 1) "Traced-Primed"
         fetch (UserId 1)
     result `shouldBe` "Traced-Primed"
@@ -1078,39 +1078,39 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
       env <- mkTestEnv
       result <- runTest env $
         biselect
-          (pure (Right "a") :: FetchT TestM (Either () String))
-          (pure (Right "b") :: FetchT TestM (Either () String))
+          (pure (Right "a") :: Fetch TestM (Either () String))
+          (pure (Right "b") :: Fetch TestM (Either () String))
       result `shouldBe` Right ("a", "b")
 
     it "left pure Left → short-circuits immediately" $ do
       env <- mkTestEnv
       result <- runTest env $
         biselect
-          (pure (Left "stop") :: FetchT TestM (Either String String))
-          (pure (Right "b") :: FetchT TestM (Either String String))
+          (pure (Left "stop") :: Fetch TestM (Either String String))
+          (pure (Right "b") :: Fetch TestM (Either String String))
       result `shouldBe` Left "stop"
 
     it "right pure Left → short-circuits immediately" $ do
       env <- mkTestEnv
       result <- runTest env $
         biselect
-          (pure (Right "a") :: FetchT TestM (Either String String))
-          (pure (Left "stop") :: FetchT TestM (Either String String))
+          (pure (Right "a") :: Fetch TestM (Either String String))
+          (pure (Left "stop") :: Fetch TestM (Either String String))
       result `shouldBe` Left "stop"
 
     it "both Left → picks the left one" $ do
       env <- mkTestEnv
       result <- runTest env $
         biselect
-          (pure (Left "first") :: FetchT TestM (Either String String))
-          (pure (Left "second") :: FetchT TestM (Either String String))
+          (pure (Left "first") :: Fetch TestM (Either String String))
+          (pure (Left "second") :: Fetch TestM (Either String String))
       result `shouldBe` Left "first"
 
     it "both blocked, both Right → pairs values in one round" $ do
       env <- mkTestEnv
       (result, rounds) <- runTestWithRoundLog env $
         biselect
-          (Right <$> fetch (UserId 1) :: FetchT TestM (Either () String))
+          (Right <$> fetch (UserId 1) :: Fetch TestM (Either () String))
           (Right <$> fetch (PostId 10))
       result `shouldBe` Right ("Alice", "Hello World")
       length rounds `shouldBe` 1
@@ -1125,7 +1125,7 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
       -- If biselect short-circuits, that batchFetch is never called.
       result <- runTest env $
         biselect
-          (pure (Left "short") :: FetchT TestM (Either String String))
+          (pure (Left "short") :: Fetch TestM (Either String String))
           (Right <$> fetch (BlockingKey 1))
       result `shouldBe` Left "short"
       -- Prove the blocked side's batch was never entered
@@ -1136,8 +1136,8 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
       env <- mkTestEnv
       result <- runTest env $
         biselect
-          (Right <$> fetch (BlockingKey 1) :: FetchT TestM (Either String String))
-          (pure (Left "short") :: FetchT TestM (Either String String))
+          (Right <$> fetch (BlockingKey 1) :: Fetch TestM (Either String String))
+          (pure (Left "short") :: Fetch TestM (Either String String))
       result `shouldBe` Left "short"
       started <- tryTakeMVar (envAsyncStarted env)
       started `shouldBe` Nothing
@@ -1149,7 +1149,7 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
       (result, rounds) <- runTestWithRoundLog env $
         biselect
           (do name <- fetch (UserId 1)
-              pure (Left name) :: FetchT TestM (Either String ()))
+              pure (Left name) :: Fetch TestM (Either String ()))
           (do _ <- fetch (PostId 10)
               v <- fetch (BlockingKey 1)  -- would block forever
               pure (Right v))
@@ -1307,22 +1307,22 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
 mockSpec :: Spec
 mockSpec = describe "Fetch.Mock" $ do
 
-  it "runMockFetchT with matching data returns value" $ do
+  it "runMockFetch with matching data returns value" $ do
     let mocks = mockData @UserId [(UserId 1, "Alice")]
-    result <- runMockFetchT @TestM mocks $ fetch (UserId 1)
+    result <- runMockFetch @TestM mocks $ fetch (UserId 1)
     result `shouldBe` "Alice"
 
   it "fetch with missing key throws" $ do
     let mocks = mockData @UserId [(UserId 1, "Alice")]
     result <- try @SomeException $
-      runMockFetchT @TestM mocks $ fetch (UserId 999)
+      runMockFetch @TestM mocks $ fetch (UserId 999)
     case result of
       Left _  -> pure ()
       Right _ -> expectationFailure "Expected exception for missing key"
 
   it "tryFetch with missing key returns Left" $ do
     let mocks = mockData @UserId [(UserId 1, "Alice")]
-    result <- runMockFetchT @TestM mocks $ tryFetch (UserId 999)
+    result <- runMockFetch @TestM mocks $ tryFetch (UserId 999)
     case result of
       Left _  -> pure ()
       Right _ -> expectationFailure "Expected Left for missing key"
@@ -1330,13 +1330,13 @@ mockSpec = describe "Fetch.Mock" $ do
   it "multiple source types in one ResultMap" $ do
     let mocks = mockData @UserId [(UserId 1, "Alice")]
              <> mockData @PostId [(PostId 10, "Hello")]
-    (user, post) <- runMockFetchT @TestM mocks $
+    (user, post) <- runMockFetch @TestM mocks $
       (,) <$> fetch (UserId 1) <*> fetch (PostId 10)
     user `shouldBe` "Alice"
     post `shouldBe` "Hello"
 
   it "emptyMockData causes tryFetch to return Left" $ do
-    result <- runMockFetchT @TestM emptyMockData $ tryFetch (UserId 1)
+    result <- runMockFetch @TestM emptyMockData $ tryFetch (UserId 1)
     case result of
       Left _  -> pure ()
       Right _ -> expectationFailure "Expected Left for empty mock data"
@@ -1344,14 +1344,14 @@ mockSpec = describe "Fetch.Mock" $ do
   it "mock applicative: two fetches from different sources both succeed" $ do
     let mocks = mockData @UserId [(UserId 1, "Alice")]
              <> mockData @PostId [(PostId 10, "Post")]
-    (u, p) <- runMockFetchT @TestM mocks $
+    (u, p) <- runMockFetch @TestM mocks $
       (,) <$> fetch (UserId 1) <*> fetch (PostId 10)
     u `shouldBe` "Alice"
     p `shouldBe` "Post"
 
   it "mock tryFetch returns Right on success" $ do
     let mocks = mockData @UserId [(UserId 1, "Alice")]
-    result <- runMockFetchT @TestM mocks $ tryFetch (UserId 1)
+    result <- runMockFetch @TestM mocks $ tryFetch (UserId 1)
     case result of
       Right v -> v `shouldBe` "Alice"
       Left _  -> expectationFailure "Expected Right"
@@ -1359,7 +1359,7 @@ mockSpec = describe "Fetch.Mock" $ do
   it "mock fetch with no data for that source type returns error" $ do
     let mocks = mockData @PostId [(PostId 10, "Post")]
     result <- try @SomeException $
-      runMockFetchT @TestM mocks $ fetch (UserId 1)
+      runMockFetch @TestM mocks $ fetch (UserId 1)
     case result of
       Left _  -> pure ()
       Right _ -> expectationFailure "Expected exception for missing source type"
@@ -1367,16 +1367,16 @@ mockSpec = describe "Fetch.Mock" $ do
   it "mock fetch missing key throws FetchError (not ErrorCall)" $ do
     let mocks = mockData @UserId [(UserId 1, "Alice")]
     result <- try @FetchError $
-      runMockFetchT @TestM mocks $ fetch (UserId 999)
+      runMockFetch @TestM mocks $ fetch (UserId 999)
     case result of
       Left (FetchError _) -> pure ()
       Right _ -> expectationFailure "Expected FetchError for missing key"
 
-  it "MockMutateT fetch missing key throws FetchError (not ErrorCall)" $ do
+  it "MockMutate fetch missing key throws FetchError (not ErrorCall)" $ do
     let mocks = mockData @UserId [(UserId 1, "Alice")]
         handlers = emptyMutationHandlers
     result <- try @FetchError $ do
-      (v, _) <- runMockMutateT @TestM mocks handlers $ fetch (UserId 999)
+      (v, _) <- runMockMutate @TestM mocks handlers $ fetch (UserId 999)
       pure v
     case result of
       Left (FetchError _) -> pure ()
@@ -1399,7 +1399,7 @@ tracedSpec = describe "Fetch.Traced" $ do
           , onFetchComplete = \_ -> pure ()
           }
     (result, stats) <- runTestM env $
-      runTracedFetchT (runTestM env) testLiftIO tc $ do
+      runTracedFetch (fetchConfig (runTestM env) testLiftIO) tc $ do
         (,) <$> fetch (UserId 1) <*> fetch (UserId 2)
     fst result `shouldBe` "Alice"
     snd result `shouldBe` "Bob"
@@ -1413,16 +1413,16 @@ tracedSpec = describe "Fetch.Traced" $ do
   it "multiple rounds tracked correctly" $ do
     env <- mkTestEnv
     (_, stats) <- runTestM env $
-      runTracedFetchT (runTestM env) testLiftIO defaultTraceConfig $ do
+      runTracedFetch (fetchConfig (runTestM env) testLiftIO) defaultTraceConfig $ do
         _ <- fetch (UserId 1)
         fetch (UserId 2)
     totalRounds stats `shouldBe` 2
     totalKeys stats `shouldBe` 2
 
-  it "same batching behavior as FetchT" $ do
+  it "same batching behavior as Fetch" $ do
     env <- mkTestEnv
     ((a, b), _) <- runTestM env $
-      runTracedFetchT (runTestM env) testLiftIO defaultTraceConfig $
+      runTracedFetch (fetchConfig (runTestM env) testLiftIO) defaultTraceConfig $
         (,) <$> fetch (UserId 1) <*> fetch (PostId 10)
     a `shouldBe` "Alice"
     b `shouldBe` "Hello World"
@@ -1436,7 +1436,7 @@ tracedSpec = describe "Fetch.Traced" $ do
           , onFetchComplete = \s -> testLiftIO $ writeIORef statsRef (Just s)
           }
     _ <- runTestM env $
-      runTracedFetchT (runTestM env) testLiftIO tc $ fetch (UserId 1)
+      runTracedFetch (fetchConfig (runTestM env) testLiftIO) tc $ fetch (UserId 1)
     ms <- readIORef statsRef
     case ms of
       Just s  -> totalRounds s `shouldBe` 1
@@ -1445,30 +1445,30 @@ tracedSpec = describe "Fetch.Traced" $ do
   it "FetchStats.totalTime is non-negative" $ do
     env <- mkTestEnv
     (_, stats) <- runTestM env $
-      runTracedFetchT (runTestM env) testLiftIO defaultTraceConfig $
+      runTracedFetch (fetchConfig (runTestM env) testLiftIO) defaultTraceConfig $
         fetch (UserId 1)
     totalTime stats `shouldSatisfy` (>= 0)
 
   it "FetchStats.maxSourcesPerRound reports correct max" $ do
     env <- mkTestEnv
     (_, stats) <- runTestM env $
-      runTracedFetchT (runTestM env) testLiftIO defaultTraceConfig $
+      runTracedFetch (fetchConfig (runTestM env) testLiftIO) defaultTraceConfig $
         (,) <$> fetch (UserId 1) <*> fetch (PostId 10)
     maxSourcesPerRound stats `shouldBe` 2
 
-  it "primeCache through TracedFetchT works" $ do
+  it "primeCache through TracedFetch works" $ do
     env <- mkTestEnv
     (result, stats) <- runTestM env $
-      runTracedFetchT (runTestM env) testLiftIO defaultTraceConfig $ do
+      runTracedFetch (fetchConfig (runTestM env) testLiftIO) defaultTraceConfig $ do
         primeCache (UserId 1) "Traced-Prime"
         fetch (UserId 1)
     result `shouldBe` "Traced-Prime"
     totalRounds stats `shouldBe` 0
 
-  it "tryFetch returns Left for missing key through TracedFetchT" $ do
+  it "tryFetch returns Left for missing key through TracedFetch" $ do
     env <- mkTestEnv
     (result, _) <- runTestM env $
-      runTracedFetchT (runTestM env) testLiftIO defaultTraceConfig $
+      runTracedFetch (fetchConfig (runTestM env) testLiftIO) defaultTraceConfig $
         tryFetch (UserId 999)
     case result of
       Left _  -> pure ()
@@ -1483,7 +1483,7 @@ tracedSpec = describe "Fetch.Traced" $ do
           , onFetchComplete = \_ -> pure ()
           }
     _ <- runTestM env $
-      runTracedFetchT (runTestM env) testLiftIO tc $ do
+      runTracedFetch (fetchConfig (runTestM env) testLiftIO) tc $ do
         _ <- fetch (UserId 1)
         _ <- fetch (UserId 2)
         fetch (UserId 3)
@@ -1846,7 +1846,7 @@ engineRaceSpec = describe "Engine dispatch" $ do
     length results `shouldBe` 100
     results `shouldBe` ["range-" <> show i | i <- [1 :: Int .. 100]]
 
-  it "concurrent runFetchTWithCache from multiple threads: no crash" $ do
+  it "concurrent runFetchWithCache from multiple threads: no crash" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
     barrier <- newEmptyMVar
@@ -1862,11 +1862,11 @@ engineRaceSpec = describe "Engine dispatch" $ do
     mapM_ takeMVar doneVars
 
 -- ──────────────────────────────────────────────
--- FetchT / primeCache races
+-- Fetch / primeCache races
 -- ──────────────────────────────────────────────
 
 fetchTRaceSpec :: Spec
-fetchTRaceSpec = describe "FetchT / primeCache" $ do
+fetchTRaceSpec = describe "Fetch / primeCache" $ do
 
   it "concurrent primeCache + fetch for same key: no corruption" $ do
     mapM_ (\_ -> do
@@ -2068,19 +2068,19 @@ instance MutationSource TestM FailMutation where
     error "FailMutation always throws"
 
 -- ══════════════════════════════════════════════
--- MutateT tests
+-- Mutate tests
 -- ══════════════════════════════════════════════
 
--- | Run a MutateT computation over TestM in IO.
-runMutateTest :: TestEnv -> MutateT TestM TestM a -> IO a
-runMutateTest env = runTestM env . runMutateT (runTestM env) testLiftIO
+-- | Run a Mutate computation over TestM in IO.
+runMutateest :: TestEnv -> Mutate TestM TestM a -> IO a
+runMutateest env = runTestM env . runMutate (fetchConfig (runTestM env) testLiftIO)
 
--- | Run a MutateT computation with an externally-provided cache.
-runMutateTestWithCache :: TestEnv -> CacheRef -> MutateT TestM TestM a -> IO a
-runMutateTestWithCache env cRef = runTestM env . runMutateTWithCache (runTestM env) testLiftIO cRef
+-- | Run a Mutate computation with an externally-provided cache.
+runMutateestWithCache :: TestEnv -> CacheRef -> Mutate TestM TestM a -> IO a
+runMutateestWithCache env cRef = runTestM env . runMutate ((fetchConfig (runTestM env) testLiftIO) { configCache = Just cRef })
 
 mutateSpec :: Spec
-mutateSpec = describe "Fetch.Mutate (MutateT)" $ do
+mutateSpec = describe "Fetch.Mutate (Mutate)" $ do
   mutateBasicSpec
   mutateFetchInteractionSpec
   mutateApplicativeSpec
@@ -2093,53 +2093,53 @@ mutateBasicSpec = describe "basic mutations" $ do
 
   it "mutate returns correct result" $ do
     env <- mkTestEnv
-    result <- runMutateTest env $ mutate (UpdateUser (UserId 1) "NewAlice")
+    result <- runMutateest env $ mutate (UpdateUser (UserId 1) "NewAlice")
     result `shouldBe` "updated-NewAlice-1"
 
   it "tryMutate returns Right on success" $ do
     env <- mkTestEnv
-    result <- runMutateTest env $ tryMutate (UpdateUser (UserId 1) "NewAlice")
+    result <- runMutateest env $ tryMutate (UpdateUser (UserId 1) "NewAlice")
     case result of
       Right v -> v `shouldBe` "updated-NewAlice-1"
       Left _  -> expectationFailure "Expected Right"
 
   it "tryMutate catches exception" $ do
     env <- mkTestEnv
-    result <- runMutateTest env $ tryMutate FailMutation
+    result <- runMutateest env $ tryMutate FailMutation
     case result of
       Left _  -> pure ()
       Right _ -> expectationFailure "Expected Left"
 
   it "mutate throws on exception" $ do
     env <- mkTestEnv
-    result <- try @SomeException $ runMutateTest env $ mutate FailMutation
+    result <- try @SomeException $ runMutateest env $ mutate FailMutation
     case result of
       Left _  -> pure ()
       Right _ -> expectationFailure "Expected exception"
 
   it "pure with no mutations completes immediately" $ do
     env <- mkTestEnv
-    result <- runMutateTest env $ pure (42 :: Int)
+    result <- runMutateest env $ pure (42 :: Int)
     result `shouldBe` 42
 
 mutateFetchInteractionSpec :: Spec
 mutateFetchInteractionSpec = describe "fetch-mutate-fetch interaction" $ do
 
-  it "fetch works within MutateT" $ do
+  it "fetch works within Mutate" $ do
     env <- mkTestEnv
-    result <- runMutateTest env $ fetch (UserId 1)
+    result <- runMutateest env $ fetch (UserId 1)
     result `shouldBe` "Alice"
 
-  it "tryFetch works within MutateT" $ do
+  it "tryFetch works within Mutate" $ do
     env <- mkTestEnv
-    result <- runMutateTest env $ tryFetch (UserId 1)
+    result <- runMutateest env $ tryFetch (UserId 1)
     case result of
       Right v -> v `shouldBe` "Alice"
       Left _  -> expectationFailure "Expected Right"
 
   it "fetch-mutate-fetch: second fetch sees primed cache from reconcileCache" $ do
     env <- mkTestEnv
-    (valBefore, valAfter) <- runMutateTest env $ do
+    (valBefore, valAfter) <- runMutateest env $ do
       b <- fetch (UserId 1)
       _ <- mutate (UpdateUser (UserId 1) "NewAlice")
       a <- fetch (UserId 1)
@@ -2152,25 +2152,25 @@ mutateFetchInteractionSpec = describe "fetch-mutate-fetch interaction" $ do
   it "fetch after delete mutation misses cache" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
-    _ <- runMutateTestWithCache env cRef $ do
+    _ <- runMutateestWithCache env cRef $ do
       _ <- fetch (UserId 1)
       _ <- mutate (DeleteUser (UserId 1))
       tryFetch (UserId 1)
     batches <- readIORef (envUserLog env)
     length batches `shouldBe` 2
 
-  it "multiple fetches batch in a single round within MutateT" $ do
+  it "multiple fetches batch in a single round within Mutate" $ do
     env <- mkTestEnv
-    (a, b) <- runMutateTest env $
+    (a, b) <- runMutateest env $
       (,) <$> fetch (UserId 1) <*> fetch (UserId 2)
     a `shouldBe` "Alice"
     b `shouldBe` "Bob"
     batches <- readIORef (envUserLog env)
     length batches `shouldBe` 1
 
-  it "primeCache works within MutateT" $ do
+  it "primeCache works within Mutate" $ do
     env <- mkTestEnv
-    result <- runMutateTest env $ do
+    result <- runMutateest env $ do
       primeCache (UserId 1) "Primed"
       fetch (UserId 1)
     result `shouldBe` "Primed"
@@ -2182,7 +2182,7 @@ mutateApplicativeSpec = describe "applicative behavior" $ do
 
   it "fetches batch, mutation fires only after all fetches" $ do
     env <- mkTestEnv
-    (user, updated, post) <- runMutateTest env $
+    (user, updated, post) <- runMutateest env $
       (,,)
         <$> fetch (UserId 1)
         <*> mutate (UpdateUser (UserId 2) "NewBob")
@@ -2197,7 +2197,7 @@ mutateApplicativeSpec = describe "applicative behavior" $ do
 
   it "two mutations in <*>: both execute sequentially (left then right)" $ do
     env <- mkTestEnv
-    (r1, r2) <- runMutateTest env $
+    (r1, r2) <- runMutateest env $
       (,) <$> mutate (UpdateUser (UserId 1) "First")
           <*> mutate (UpdateUser (UserId 2) "Second")
     r1 `shouldBe` "updated-First-1"
@@ -2205,13 +2205,13 @@ mutateApplicativeSpec = describe "applicative behavior" $ do
 
   it "fmap over mutation result transforms it" $ do
     env <- mkTestEnv
-    result <- runMutateTest env $
+    result <- runMutateest env $
       fmap (++ "!") (mutate (UpdateUser (UserId 1) "Bang"))
     result `shouldBe` "updated-Bang-1!"
 
   it "three-way applicative: fetch + mutation + fetch" $ do
     env <- mkTestEnv
-    (a, b, c) <- runMutateTest env $
+    (a, b, c) <- runMutateest env $
       (,,) <$> fetch (UserId 1)
            <*> mutate (UpdateUser (UserId 2) "M")
            <*> fetch (UserId 3)
@@ -2224,7 +2224,7 @@ mutateMonadicSpec = describe "monadic behavior" $ do
 
   it "fetch >>= mutate >>= fetch: correct sequencing" $ do
     env <- mkTestEnv
-    (valBefore, result, valAfter) <- runMutateTest env $ do
+    (valBefore, result, valAfter) <- runMutateest env $ do
       b <- fetch (UserId 1)
       r <- mutate (UpdateUser (UserId 1) "Updated")
       a <- fetch (UserId 1)
@@ -2235,14 +2235,14 @@ mutateMonadicSpec = describe "monadic behavior" $ do
 
   it "mutation result used in subsequent fetch key" $ do
     env <- mkTestEnv
-    result <- runMutateTest env $ do
+    result <- runMutateest env $ do
       _ <- mutate (UpdateUser (UserId 1) "Dynamic")
       fetch (UserId 2)
     result `shouldBe` "Bob"
 
   it "two sequential mutations" $ do
     env <- mkTestEnv
-    (r1, r2) <- runMutateTest env $ do
+    (r1, r2) <- runMutateest env $ do
       a <- mutate (UpdateUser (UserId 1) "First")
       b <- mutate (UpdateUser (UserId 2) "Second")
       pure (a, b)
@@ -2251,7 +2251,7 @@ mutateMonadicSpec = describe "monadic behavior" $ do
 
   it "conditional mutation based on fetch result" $ do
     env <- mkTestEnv
-    result <- runMutateTest env $ do
+    result <- runMutateest env $ do
       name <- fetch (UserId 1)
       if name == "Alice"
         then mutate (UpdateUser (UserId 1) "ConditionalUpdate")
@@ -2260,7 +2260,7 @@ mutateMonadicSpec = describe "monadic behavior" $ do
 
   it "tryMutate failure doesn't prevent subsequent operations" $ do
     env <- mkTestEnv
-    (err, val) <- runMutateTest env $ do
+    (err, val) <- runMutateest env $ do
       e <- tryMutate FailMutation
       v <- fetch (UserId 1)
       pure (e, v)
@@ -2270,25 +2270,25 @@ mutateMonadicSpec = describe "monadic behavior" $ do
     val `shouldBe` "Alice"
 
 mutateMockSpec :: Spec
-mutateMockSpec = describe "MockMutateT" $ do
+mutateMockSpec = describe "MockMutate" $ do
 
   it "mock mutation returns handler result" $ do
     let mocks = mockData @UserId [(UserId 1, "Alice")]
         handlers = mockMutation @UpdateUser (\(UpdateUser _ n) -> "mock-" <> n)
-    (result, _) <- runMockMutateT @TestM mocks handlers $ mutate (UpdateUser (UserId 1) "Test")
+    (result, _) <- runMockMutate @TestM mocks handlers $ mutate (UpdateUser (UserId 1) "Test")
     result `shouldBe` "mock-Test"
 
   it "mock mutation records the mutation" $ do
     let mocks = emptyMockData
         handlers = mockMutation @UpdateUser (\(UpdateUser _ n) -> "mock-" <> n)
-    (_, mutations) <- runMockMutateT @TestM mocks handlers $
+    (_, mutations) <- runMockMutate @TestM mocks handlers $
       mutate (UpdateUser (UserId 1) "Recorded")
     length mutations `shouldBe` 1
 
   it "mock fetch works alongside mock mutations" $ do
     let mocks = mockData @UserId [(UserId 1, "Alice")]
         handlers = mockMutation @UpdateUser (\(UpdateUser _ n) -> "mock-" <> n)
-    ((user, updated), mutations) <- runMockMutateT @TestM mocks handlers $ do
+    ((user, updated), mutations) <- runMockMutate @TestM mocks handlers $ do
       u <- fetch (UserId 1)
       r <- mutate (UpdateUser (UserId 1) "NewName")
       pure (u, r)
@@ -2299,7 +2299,7 @@ mutateMockSpec = describe "MockMutateT" $ do
   it "mock tryMutate with no handler returns Left" $ do
     let mocks = emptyMockData
         handlers = emptyMutationHandlers
-    (result, _) <- runMockMutateT @TestM mocks handlers $
+    (result, _) <- runMockMutate @TestM mocks handlers $
       tryMutate (UpdateUser (UserId 1) "NoHandler")
     case result of
       Left _  -> pure ()
@@ -2309,7 +2309,7 @@ mutateMockSpec = describe "MockMutateT" $ do
     let mocks = emptyMockData
         handlers = mockMutation @UpdateUser (\(UpdateUser _ n) -> "mock-" <> n)
                 <> mockMutation @DeleteUser (\_ -> ())
-    (_, mutations) <- runMockMutateT @TestM mocks handlers $ do
+    (_, mutations) <- runMockMutate @TestM mocks handlers $ do
       _ <- mutate (UpdateUser (UserId 1) "First")
       _ <- mutate (DeleteUser (UserId 2))
       _ <- mutate (UpdateUser (UserId 3) "Third")
@@ -2322,7 +2322,7 @@ mutateCacheReconcileSpec = describe "cache reconciliation" $ do
   it "reconcileCache evicts stale keys after DeleteUser" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
-    _ <- runMutateTestWithCache env cRef $ do
+    _ <- runMutateestWithCache env cRef $ do
       _ <- fetch (UserId 1)
       mutate (DeleteUser (UserId 1))
     hit <- cacheLookup cRef (UserId 1)
@@ -2333,19 +2333,19 @@ mutateCacheReconcileSpec = describe "cache reconciliation" $ do
   it "reconcileCache primes fresh values after UpdateUser" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
-    _ <- runMutateTestWithCache env cRef $
+    _ <- runMutateestWithCache env cRef $
       mutate (UpdateUser (UserId 1) "Fresh")
     hit <- cacheLookup cRef (UserId 1)
     case hit of
       CacheHitReady v -> v `shouldBe` "updated-Fresh-1"
       _               -> expectationFailure "Expected CacheHitReady with fresh value"
 
-  it "cache shared across runMutateTWithCache: mutation effects persist" $ do
+  it "cache shared across runMutateWithCache: mutation effects persist" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
-    _ <- runMutateTestWithCache env cRef $
+    _ <- runMutateestWithCache env cRef $
       mutate (UpdateUser (UserId 1) "Shared")
-    result <- runMutateTestWithCache env cRef $
+    result <- runMutateestWithCache env cRef $
       fetch (UserId 1)
     result `shouldBe` "updated-Shared-1"
     batches <- readIORef (envUserLog env)
@@ -2903,7 +2903,7 @@ roundStatsSpec = describe "Round stats and probe" $ do
           , fetchLower = runTestM env
           , fetchLift  = testLiftIO
           }
-    status <- runTestM env $ unFetchT
+    status <- runTestM env $ unFetch
       ((,) <$> fetch (UserId 1) <*> fetch (PostId 10)) e
     case status of
       Done _       -> expectationFailure "Expected Blocked"
@@ -2924,7 +2924,7 @@ instance MC.Exception TestException
 throwCatchSpec :: Spec
 throwCatchSpec = describe "MonadThrow / MonadCatch" $ do
 
-  it "throwM in FetchT produces exception catchable at IO level" $ do
+  it "throwM in Fetch produces exception catchable at IO level" $ do
     env <- mkTestEnv
     result <- try @SomeException $ runTest env $
       MC.throwM (TestException "boom")
@@ -2932,20 +2932,20 @@ throwCatchSpec = describe "MonadThrow / MonadCatch" $ do
       Left _  -> pure ()
       Right _ -> expectationFailure "Expected exception"
 
-  it "catch in FetchT catches throwM" $ do
+  it "catch in Fetch catches throwM" $ do
     env <- mkTestEnv
     result <- runTest env $
       MC.catch
-        (MC.throwM (TestException "caught") :: FetchT TestM String)
+        (MC.throwM (TestException "caught") :: Fetch TestM String)
         (\(TestException msg) -> pure ("recovered: " <> msg))
     result `shouldBe` "recovered: caught"
 
-  it "catch in FetchT across round boundary catches later-round exception" $ do
+  it "catch in Fetch across round boundary catches later-round exception" $ do
     env <- mkTestEnv
     result <- runTest env $
       MC.catch
         (do _ <- fetch (UserId 1)  -- round 1
-            MC.throwM (TestException "round2") :: FetchT TestM String)
+            MC.throwM (TestException "round2") :: Fetch TestM String)
         (\(TestException msg) -> pure ("caught: " <> msg))
     result `shouldBe` "caught: round2"
 
@@ -2957,19 +2957,19 @@ throwCatchSpec = describe "MonadThrow / MonadCatch" $ do
         (\(_ :: SomeException) -> pure "fallback")
     result `shouldBe` "fallback"
 
-  it "throwM/catch in MutateT works" $ do
+  it "throwM/catch in Mutate works" $ do
     env <- mkTestEnv
-    result <- runMutateTest env $
+    result <- runMutateest env $
       MC.catch
-        (MC.throwM (TestException "mut") :: MutateT TestM TestM String)
+        (MC.throwM (TestException "mut") :: Mutate TestM TestM String)
         (\(TestException msg) -> pure ("caught: " <> msg))
     result `shouldBe` "caught: mut"
 
-  it "throwM/catch in MockFetchT works via delegation" $ do
+  it "throwM/catch in MockFetch works via delegation" $ do
     let mocks = mockData @UserId [(UserId 1, "Alice")]
-    result <- runMockFetchT @TestM mocks $
+    result <- runMockFetch @TestM mocks $
       MC.catch
-        (MC.throwM (TestException "mock") :: MockFetchT TestM IO String)
+        (MC.throwM (TestException "mock") :: MockFetch TestM IO String)
         (\(TestException msg) -> pure ("caught: " <> msg))
     result `shouldBe` "caught: mock"
 
@@ -2980,8 +2980,8 @@ throwCatchSpec = describe "MonadThrow / MonadCatch" $ do
 asyncExceptionSpec :: Spec
 asyncExceptionSpec = describe "Async exception safety" $ do
   asyncIVarSpec
-  asyncFetchTSpec
-  asyncMutateTSpec
+  asyncFetchSpec
+  asyncMutateSpec
 
 asyncIVarSpec :: Spec
 asyncIVarSpec = describe "IVar" $ do
@@ -3046,8 +3046,8 @@ asyncIVarSpec = describe "IVar" $ do
       Right v -> v `shouldBe` 99
       Left _  -> expectationFailure "Expected Right from surviving reader"
 
-asyncFetchTSpec :: Spec
-asyncFetchTSpec = describe "FetchT" $ do
+asyncFetchSpec :: Spec
+asyncFetchSpec = describe "Fetch" $ do
 
   it "cancel during batch execution propagates to caller" $ do
     env <- mkTestEnv
@@ -3118,7 +3118,7 @@ asyncFetchTSpec = describe "FetchT" $ do
       CacheMiss -> expectationFailure "Expected cache entry for BlockingKey 1"
 
   it "MonadCatch handler is NOT invoked for async exceptions during batch execution" $ do
-    -- FetchT's catch wraps the probe phase, not batch execution.
+    -- Fetch's catch wraps the probe phase, not batch execution.
     -- Async exceptions during executeBatches bypass MonadCatch.
     env <- mkTestEnv
     handlerCalled <- newIORef False
@@ -3181,13 +3181,13 @@ asyncFetchTSpec = describe "FetchT" $ do
     let allFetchedUsers = concat userLog
     allFetchedUsers `shouldNotContain` [UserId 1]
 
-asyncMutateTSpec :: Spec
-asyncMutateTSpec = describe "MutateT" $ do
+asyncMutateSpec :: Spec
+asyncMutateSpec = describe "Mutate" $ do
 
   it "cancel before mutation: mutation never executes" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
-    handle <- async $ runMutateTestWithCache env cRef $ do
+    handle <- async $ runMutateestWithCache env cRef $ do
       _ <- fetch (UserId 1)       -- round 1: succeeds
       _ <- fetch (BlockingKey 1)  -- round 2: blocks, gets cancelled
       mutate (UpdateUser (UserId 1) "ShouldNotHappen")
@@ -3201,9 +3201,9 @@ asyncMutateTSpec = describe "MutateT" $ do
       CacheHitReady v -> v `shouldBe` "Alice"
       _               -> expectationFailure "Expected CacheHitReady for UserId 1"
 
-  it "cancel during fetch phase of MutateT propagates exception" $ do
+  it "cancel during fetch phase of Mutate propagates exception" $ do
     env <- mkTestEnv
-    handle <- async $ runMutateTest env $ do
+    handle <- async $ runMutateest env $ do
       fetch (BlockingKey 1)  -- blocks, gets cancelled
     takeMVar (envAsyncStarted env)
     cancel handle

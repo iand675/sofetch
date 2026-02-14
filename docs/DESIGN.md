@@ -71,10 +71,10 @@ instance DataSource AppM UserId where
     withResource (appPool env) $ \conn ->
       query conn "SELECT * FROM users WHERE id = ANY(?)" (Only ids)
 
-runFetchT :: Monad m
+runFetch :: Monad m
           => (forall x. m x -> IO x)
           -> (forall x. IO x -> m x)
-          -> FetchT m a
+          -> Fetch m a
           -> m a
 ```
 
@@ -84,7 +84,7 @@ runFetchT :: Monad m
 - *Pro:* No `Dynamic`, no heterogeneous maps, no `Proxy` gymnastics at registration sites.
 - *Pro:* The monad is explicit. You choose `m` to be whatever has the capabilities your sources need: `ReaderT AppEnv IO`, a test monad, etc.
 - *Pro:* Dependencies are explicit in the type: `DataSource AppM UserId` says "to fetch users, you need an `AppM`" (which carries the env).
-- *Con:* The `m` type appears in `MonadFetch m n`, `FetchT m`, and every `DataSource m k` instance. In practice this is one type, typically aliased, so the noise is manageable.
+- *Con:* The `m` type appears in `MonadFetch m n`, `Fetch m`, and every `DataSource m k` instance. In practice this is one type, typically aliased, so the noise is manageable.
 - *Con:* If you want different monads for different contexts (e.g., test vs. prod), you either parameterize your data access code (`DataSource m UserId => ...`) or define instances for both monads. Parameterizing adds constraints but is explicit about what sources a function uses.
 
 ---
@@ -129,11 +129,11 @@ All Haxl computation lives inside this monad. IO actions are lifted in via `lift
 
 **Fetch's approach:**
 
-`FetchT` is a monad transformer over the source monad `m`:
+`Fetch` is a monad transformer over the source monad `m`:
 
 ```haskell
-newtype FetchT m a = FetchT
-  { unFetchT :: FetchEnv m -> m (Status m (FetchT m) a) }
+newtype Fetch m a = Fetch
+  { unFetch :: FetchEnv m -> m (Status m (Fetch m) a) }
 ```
 
 The source monad `m` is arbitrary. Two natural transformations are provided at the runner: `lower :: m x -> IO x` to run source actions in IO (where the actual fetching happens), and `lift :: IO x -> m x` to lift IO into the source monad.
@@ -157,10 +157,10 @@ The obvious constraint for a monad that needs to do IO is `MonadIO m`. But this 
 **The nat approach:**
 
 ```haskell
-runFetchT :: Monad m
+runFetch :: Monad m
           => (forall x. m x -> IO x)
           -> (forall x. IO x -> m x)
-          -> FetchT m a
+          -> Fetch m a
           -> m a
 ```
 
@@ -170,8 +170,8 @@ Two natural transformations are provided at the run site and captured in `FetchE
 
 - *Pro:* Clean type signatures. `getUserFeed :: (MonadFetch m n, DataSource m UserId) => UserId -> n Feed` requires no `MonadIO`, no `MonadReader`, no constraints beyond what the function actually needs.
 - *Pro:* Tests can provide mock nats. The nats are the single point of control for how IO is introduced.
-- *Con:* Both nats must be provided at every `runFetchT` call site. In production, `lower` is typically `runAppM env` (or similar) and `lift` is `liftIO`; in tests they can be trivial. This is effectively what MonadUnliftIO represents, but there
-are cases where you have a monad with restricted IO capabilities (e.g. a transaction monad) that you want to run FetchT in,
+- *Con:* Both nats must be provided at every `runFetch` call site. In production, `lower` is typically `runAppM env` (or similar) and `lift` is `liftIO`; in tests they can be trivial. This is effectively what MonadUnliftIO represents, but there
+are cases where you have a monad with restricted IO capabilities (e.g. a transaction monad) that you want to run Fetch in,
 so this lets you do that without opening the floodgates to arbitrary IO.
 
 ---
@@ -191,7 +191,7 @@ An `IORef` is the simplest correct solution. The cache `IORef` is created by the
 **Tradeoffs:**
 
 - *Pro:* Simple, correct, zero overhead compared to alternatives.
-- *Con:* The `IORef` exists even when `m` is pure. In the `MockFetchT` implementation this is irrelevant since it doesn't use the cache at all.
+- *Con:* The `IORef` exists even when `m` is pure. In the `MockFetch` implementation this is irrelevant since it doesn't use the cache at all.
 
 ---
 
@@ -253,9 +253,9 @@ Multiple implementations:
 
 | Implementation | Purpose |
 |---|---|
-| `FetchT m` | Production batching with caching and IVar dedup |
-| `TracedFetchT m` | Batching with round-by-round observability hooks |
-| `MockFetchT m n` | Pure, non-batching, reads from a pre-built result map (`m` phantom, `n` base) |
+| `Fetch m` | Production batching with caching and IVar dedup |
+| `TracedFetch m` | Batching with round-by-round observability hooks |
+| `MockFetch m n` | Pure, non-batching, reads from a pre-built result map (`m` phantom, `n` base) |
 
 **Tradeoffs:**
 
@@ -329,7 +329,7 @@ fetchMap     :: ... => (a -> k) -> (a -> Result k -> b) -> t a -> n (t b)
 fetchMapWith :: ... => f k -> n (HashMap k (Result k))
 ```
 
-All of these are implemented in terms of `traverse fetch`, which means `FetchT`'s `Applicative` instance automatically batches everything in a single round.
+All of these are implemented in terms of `traverse fetch`, which means `Fetch`'s `Applicative` instance automatically batches everything in a single round.
 
 **Tradeoffs:**
 
@@ -385,7 +385,7 @@ cacheContents    :: ... => CacheRef -> Proxy k -> IO (HashMap k (Result k))
 
 `cacheWarm` creates pre-filled IVars for known values. This enables hydrating from an external cache (Redis, etc.) at request start, so subsequent `fetch` calls hit memory.
 
-The `CacheRef` can be exported from `runFetchTWithCache` and reused across multiple `runFetchT` calls, enabling cache sharing across sequential phases of request processing.
+The `CacheRef` can be exported from `runFetchWithCache` and reused across multiple `runFetch` calls, enabling cache sharing across sequential phases of request processing.
 
 **Tradeoffs:**
 
@@ -448,14 +448,14 @@ memoOn :: (Typeable a, ...) => MemoStore -> ... -> k -> m a -> m a
 | Request types | GADT per source | `FetchKey` + type family | Eliminates GADTs from user code |
 | Source config | `StateKey` + `StateStore` + runtime lookup | Monad `m` on `DataSource m k` | Compile-time safety, no `Dynamic` |
 | Source definition | `DataSource` + `StateKey` + `BlockedFetch` | `DataSource m k` + `batchFetch` | One function instead of five concepts |
-| Monad | Concrete `GenHaxl u w` | `FetchT m` transformer | Composable with existing stacks |
+| Monad | Concrete `GenHaxl u w` | `Fetch m` transformer | Composable with existing stacks |
 | IO bridge | `MonadIO` / `liftIO` | Two natural transformations at run site | Cleaner constraints, testable |
 | Concurrency | User-built `PerformFetch` | Declarative `FetchStrategy` | Engine handles async |
 | Interface | Concrete monad | `MonadFetch m n` type class | Swappable implementations |
 | In-flight dedup | `ResultVar` + `IVar` | `IVar` + `cacheAllocate` | Same semantics, cleaner API |
 | Error handling | `ResultVar` exceptions | `IVar` exceptions + `tryFetch` | Per-key errors with explicit opt-in |
 | Cache | Limited export | Full eviction, warming, export | Cache as first-class value |
-| Profiling | Built into `GenHaxl` | Separate `TracedFetchT m` | Separation of concerns |
+| Profiling | Built into `GenHaxl` | Separate `TracedFetch m` | Separation of concerns |
 | Memoization | `memo` inside `GenHaxl` | Separate `MemoStore` | Decoupled from fetch cache |
 | Collection ops | Manual `traverse` | `fetchAll`, `fetchThrough`, `fetchMap` | Shape-preserving convenience |
 
@@ -473,7 +473,7 @@ memoOn :: (Typeable a, ...) => MemoStore -> ... -> k -> m a -> m a
 
 ## Recommended Usage
 
-Enable `ApplicativeDo` in all modules that use `fetch`. Write data access code against `MonadFetch`. Define data sources with `FetchKey` + `DataSource`. Call `runFetchT` with two natural transformations.
+Enable `ApplicativeDo` in all modules that use `fetch`. Write data access code against `MonadFetch`. Define data sources with `FetchKey` + `DataSource`. Call `runFetch` with two natural transformations.
 
 ```haskell
 {-# LANGUAGE ApplicativeDo #-}
@@ -504,7 +504,7 @@ runAppM env = flip runReaderT env
 
 handleRequest :: AppEnv -> UserId -> IO Feed
 handleRequest env uid =
-  runAppM env $ runFetchT (runAppM env) liftIO (getUserFeed uid)
+  runAppM env $ runFetch (runAppM env) liftIO (getUserFeed uid)
 ```
 
 In tests:
@@ -514,7 +514,7 @@ testGetUserFeed :: IO ()
 testGetUserFeed = do
   let mocks = mockData @UserId [(UserId 1, testUser)]
            <> mockData @PostsByAuthor [(PostsByAuthor 1, [testPost])]
-  feed <- runMockFetchT @AppM mocks (getUserFeed (UserId 1))
+  feed <- runMockFetch @AppM mocks (getUserFeed (UserId 1))
   assertEqual (feedUser feed) testUser
 ```
 
@@ -528,10 +528,10 @@ testGetUserFeed = do
 | `Fetch.IVar` | Write-once variable with error support |
 | `Fetch.Cache` | IVar-based cache with dedup, eviction, warming |
 | `Fetch.Engine` | Batch dispatch with strategy-based scheduling |
-| `Fetch.Batched` | `FetchT`, `FetchEnv`, `runFetchT`, `runFetchTWithCache`, `runLoopWith`, `runLoop` |
+| `Fetch.Batched` | `Fetch`, `FetchEnv`, `runFetch`, `runFetchWithCache`, `runLoopWith`, `runLoop` |
 | `Fetch.Combinators` | `fetchAll`, `fetchThrough`, `fetchMap`, etc. |
-| `Fetch.Mock` | `MockFetchT` and `mockData` for testing |
-| `Fetch.Traced` | `TracedFetchT` with per-round callbacks |
+| `Fetch.Mock` | `MockFetch` and `mockData` for testing |
+| `Fetch.Traced` | `TracedFetch` with per-round callbacks |
 | `Fetch.Memo` | `MemoStore`, `memo`, `memoOn` |
 | `Fetch.OpenTelemetry` | OpenTelemetry instrumentation; lives in the separate `sofetch-otel` package |
 | `Fetch` | Top-level re-exports |
