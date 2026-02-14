@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 240" width="720" height="240">
+  <style>
+    .bg        { fill: #ffffff }
+    .heading   { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                 font-size: 15px; font-weight: 700 }
+    .caption   { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                 font-size: 12px; font-weight: 500 }
+    .boxlabel  { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                 font-size: 12px; font-weight: 600 }
+    .count     { font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+                 font-size: 20px; font-weight: 700 }
+
+    .text      { fill: #24292f }
+    .muted     { fill: #656d76 }
+    .box       { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.5 }
+    .divider   { stroke: #d0d7de; stroke-width: 1.5; stroke-dasharray: 6 4 }
+
+    .bad       { fill: #cf222e }
+    .bad-line  { stroke: #cf222e; stroke-width: 2 }
+    .bad-box   { fill: #ffebe9; stroke: #cf222e; stroke-width: 1.5 }
+
+    .good      { fill: #8250df }
+    .good-thin { stroke: #8250df; stroke-width: 1.5; stroke-opacity: 0.45 }
+    .good-line { stroke: #8250df; stroke-width: 3 }
+    .good-box  { fill: #fbefff; stroke: #8250df; stroke-width: 1.5 }
+
+    @media (prefers-color-scheme: dark) {
+      .bg        { fill: #0d1117 }
+      .text      { fill: #e6edf3 }
+      .muted     { fill: #8b949e }
+      .box       { fill: #161b22; stroke: #30363d }
+      .divider   { stroke: #30363d }
+      .bad       { fill: #f85149 }
+      .bad-line  { stroke: #f85149 }
+      .bad-box   { fill: #200c0c; stroke: #f85149 }
+      .good      { fill: #a371f7 }
+      .good-thin { stroke: #a371f7 }
+      .good-line { stroke: #a371f7 }
+      .good-box  { fill: #1c1128; stroke: #a371f7 }
+    }
+  </style>
+
+  <!-- background -->
+  <rect class="bg" width="720" height="240" rx="10"/>
+
+  <!-- centre divider -->
+  <line class="divider" x1="360" y1="16" x2="360" y2="224"/>
+
+  <!-- ============ LEFT: N+1 ============ -->
+  <text class="heading bad" x="180" y="34" text-anchor="middle">Without batching</text>
+
+  <!-- App box -->
+  <rect class="box" x="32" y="52" width="64" height="148" rx="6"/>
+  <text class="boxlabel text" x="64" y="131" text-anchor="middle">App</text>
+
+  <!-- DB box -->
+  <rect class="bad-box" x="256" y="52" width="64" height="148" rx="6"/>
+  <text class="boxlabel bad" x="288" y="131" text-anchor="middle">DB</text>
+
+  <!-- 5 sequential query arrows -->
+  <line class="bad-line" x1="96" y1="78"  x2="250" y2="78"/>
+  <polygon class="bad" points="250,74 260,78 250,82"/>
+  <line class="bad-line" x1="96" y1="104" x2="250" y2="104"/>
+  <polygon class="bad" points="250,100 260,104 250,108"/>
+  <line class="bad-line" x1="96" y1="130" x2="250" y2="130"/>
+  <polygon class="bad" points="250,126 260,130 250,134"/>
+  <line class="bad-line" x1="96" y1="156" x2="250" y2="156"/>
+  <polygon class="bad" points="250,152 260,156 250,160"/>
+  <line class="bad-line" x1="96" y1="182" x2="250" y2="182"/>
+  <polygon class="bad" points="250,178 260,182 250,186"/>
+
+  <!-- label -->
+  <text class="count bad" x="180" y="228" text-anchor="middle">N queries</text>
+
+  <!-- ============ RIGHT: Batched ============ -->
+  <text class="heading good" x="540" y="34" text-anchor="middle">With sofetch</text>
+
+  <!-- App box -->
+  <rect class="box" x="392" y="52" width="64" height="148" rx="6"/>
+  <text class="boxlabel text" x="424" y="131" text-anchor="middle">App</text>
+
+  <!-- sofetch box -->
+  <rect class="good-box" x="504" y="96" width="72" height="48" rx="6"/>
+  <text class="boxlabel good" x="540" y="125" text-anchor="middle">sofetch</text>
+
+  <!-- DB box -->
+  <rect class="box" x="624" y="52" width="64" height="148" rx="6"/>
+  <text class="boxlabel text" x="656" y="131" text-anchor="middle">DB</text>
+
+  <!-- converging lines: App to sofetch -->
+  <line class="good-thin" x1="456" y1="78"  x2="504" y2="108"/>
+  <line class="good-thin" x1="456" y1="104" x2="504" y2="114"/>
+  <line class="good-thin" x1="456" y1="130" x2="504" y2="120"/>
+  <line class="good-thin" x1="456" y1="156" x2="504" y2="126"/>
+  <line class="good-thin" x1="456" y1="182" x2="504" y2="132"/>
+
+  <!-- single thick arrow: sofetch to DB -->
+  <line class="good-line" x1="576" y1="120" x2="618" y2="120"/>
+  <polygon class="good" points="618,114 630,120 618,126"/>
+
+  <!-- label -->
+  <text class="count good" x="540" y="228" text-anchor="middle">1 query</text>
+</svg>

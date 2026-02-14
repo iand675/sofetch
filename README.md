@@ -6,40 +6,108 @@
   <img src="fetch.gif" alt="That's so fetch" width="300">
 </p>
 
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--3--Clause-blue.svg" alt="License: BSD-3-Clause"></a>
+  <img src="https://img.shields.io/badge/language-Haskell-purple.svg" alt="Haskell">
+  <img src="https://img.shields.io/badge/GHC-9.2_%7C_9.4_%7C_9.6_%7C_9.8-informational.svg" alt="GHC versions">
+</p>
+
 ---
 
-Automatic batching and deduplication of concurrent data fetches for Haskell.
+## The problem
 
-Write sequential-looking code; get batched, deduplicated, concurrent data
-access. Inspired by Facebook's
-[Haxl](https://github.com/facebook/Haxl) (Marlow et al., ICFP 2014), with a
-simpler API and monad-transformer design.
+Suppose you have a web page that shows a list of blog posts, each with its
+author's name. A naive implementation fetches each author one at a time:
 
-## Key features
+```haskell
+-- Fetch each author individually, one query per post!
+renderPosts :: [Post] -> AppM [Html]
+renderPosts posts = forM posts $ \post -> do
+  author <- getUser (postAuthorId post)    -- DB round-trip
+  pure (renderPostCard post author)
+```
 
-- **No GADTs in user code.** Data sources are ordinary typeclasses with
-  associated type families. Key types use stock `deriving`.
-- **Data sources run in your monad.** `DataSource` is parameterised by a monad
-  `m`, not a concrete environment. If `m` is `ReaderT AppEnv IO`, your sources
-  have access to connection pools, config, etc. Missing instances are
-  compile-time errors.
-- **Monad transformer.** `Fetch m a` layers over your source monad. Two
-  natural transformations (`m -> IO` and `IO -> m`) bridge the gap at the run
-  site.
-- **Swappable implementations.** `MonadFetch m n` is the application-facing
-  typeclass. Production (`Fetch`), traced (`TracedFetch`), and mock
-  (`MockFetch`) all satisfy it.
-- **Extensible instrumentation.** The core provides `runLoopWith` for wrapping
-  each batch round (e.g. with tracing spans). OpenTelemetry support lives in
-  the separate [`sofetch-otel`](./sofetch-otel) package.
+Ten posts means ten separate database queries. A hundred posts means a
+hundred queries. This is the **N+1 problem**: you run 1 query to get the
+list, then N more queries to get each related item. It's one of the most
+common performance pitfalls in data-access code, and it's easy to
+introduce without noticing because each function in isolation looks
+perfectly reasonable.
+
+The typical fix is to restructure your code: collect all the
+IDs up front, run a single batched query, then stitch the results back
+together. That works, but it forces your code shape to match your
+optimisation strategy. Composition suffers: you can't freely combine small
+functions without worrying about the data-access pattern they produce.
+
+## The solution
+
+**sofetch** fixes this automatically. Write simple, sequential-looking
+code, and sofetch batches and deduplicates your data access behind the
+scenes:
+
+```haskell
+renderPosts :: (MonadFetch m n, DataSource m UserById) => [Post] -> n [Html]
+renderPosts posts =
+  -- All author fetches are batched into ONE query, automatically.
+  fetchThrough (UserById . postAuthorId) posts
+    <&> map (\(post, author) -> renderPostCard post author)
+```
+
+No matter how many posts you have, this issues a single `WHERE id IN (...)`
+query for all the authors. You didn't have to restructure anything. You
+wrote the obvious code and sofetch made it fast.
+
+<p align="center">
+  <img src="docs/n-plus-one-vs-batched.svg" alt="N+1 queries vs 1 batched query with sofetch" width="720">
+</p>
+
+This works across function boundaries too. If `renderPostCard` internally
+fetches comment counts, and `renderSidebar` fetches the same authors for a
+"top contributors" widget, sofetch merges all of those fetches together.
+Functions that were written independently, without any knowledge of each
+other, still get optimal batching when composed.
+
+## How it works (in brief)
+
+sofetch gives you a special `Fetch` monad. When you write:
+
+```haskell
+(,) <$> fetch (UserById 1) <*> fetch (UserById 2)
+```
+
+...the two fetches don't happen immediately. Instead, sofetch collects them
+into a **round**, groups them by data source, and dispatches one batched
+call per source. The `<*>` operator (or `ApplicativeDo` if you prefer
+do-notation) is the signal that two fetches are independent and can be
+batched together. The `>>=` operator (monadic bind) introduces a round
+boundary: the right side depends on the left side's result, so it has to
+wait.
+
+```mermaid
+flowchart LR
+  f1["fetch (UserById 1)"] --> b1["batchFetch<br/>[UserById 1, 2]"]
+  f2["fetch (UserById 2)"] --> b1
+  f3["fetch (PostsByAuthor 1)"] --> b2["batchFetch<br/>[PostsByAuthor 1]"]
+  b1 -. "concurrent" .- b2
+```
+
+Within each round:
+
+- Keys for the **same data source** are grouped into one `batchFetch` call.
+- Keys for **different data sources** run concurrently.
+- **Duplicate keys** are deduplicated. The same key appearing in multiple
+  places produces only one fetch, and all callers share the result.
+- Results are **cached** so the same key never hits the database twice (unless
+  you opt out).
 
 ## Quick start
 
 ### 1. Define key types
 
-Each type of data you fetch gets its own key type with a `FetchKey` instance
-that declares the result type. `FetchKey` requires `Typeable`, `Hashable`,
-`Eq`, and `Show` -- all derivable with stock or anyclass strategies:
+Each kind of data you want to fetch gets a **key type**, a small type that
+says "I want to look up *this thing*" and declares what the result will be.
+This is the core modelling step: one key type per query shape.
 
 ```haskell
 {-# LANGUAGE DeriveGeneric, DeriveAnyClass, DerivingStrategies, TypeFamilies #-}
@@ -47,13 +115,15 @@ that declares the result type. `FetchKey` requires `Typeable`, `Hashable`,
 data User = User { userId :: Int, userName :: Text }
 data Post = Post { postId :: Int, postAuthorId :: Int, postTitle :: Text }
 
-newtype UserId = UserId Int
+-- "Give me a user by their ID"
+newtype UserById = UserById Int
   deriving stock (Eq, Ord, Show, Generic)
   deriving anyclass (Hashable)
 
-instance FetchKey UserId where
-  type Result UserId = User
+instance FetchKey UserById where
+  type Result UserById = User
 
+-- "Give me all posts by this author"
 newtype PostsByAuthor = PostsByAuthor Int
   deriving stock (Eq, Ord, Show, Generic)
   deriving anyclass (Hashable)
@@ -62,73 +132,72 @@ instance FetchKey PostsByAuthor where
   type Result PostsByAuthor = [Post]
 ```
 
-### 2. Define data sources
+The key type carries the query parameter (the user ID, the author ID) and
+the `FetchKey` instance tells sofetch what type the answer will be. All the
+required instances (`Eq`, `Hashable`, `Show`, etc.) are stock-derivable, no
+boilerplate.
 
-A `DataSource` instance teaches the engine how to batch-fetch keys. The
-monad `m` provides any resources the source needs (connection pool, config,
-etc.). `batchFetch` receives a `NonEmpty k` and must return a `HashMap k
-(Result k)` with an entry for every key:
+### 2. Teach sofetch how to fetch them
+
+A `DataSource` instance tells sofetch how to batch-fetch a group of keys.
+You receive a `NonEmpty` list of keys and return a `HashMap` of results,
+one entry per key:
 
 ```haskell
-newtype AppM a = AppM (ReaderT AppEnv IO a)
-  deriving (Functor, Applicative, Monad, MonadIO, MonadUnliftIO, MonadReader AppEnv)
-
-instance DataSource AppM UserId where
+instance DataSource AppM UserById where
   batchFetch keys = do
     pool <- asks appPool
-    let ids = [uid | UserId uid <- toList keys]
+    let ids = [uid | UserById uid <- toList keys]
     rows <- liftIO $ withResource pool $ \conn ->
       query conn "SELECT id, name FROM users WHERE id = ANY(?)" (Only ids)
-    pure $ HM.fromList [(UserId (userId u), u) | u <- rows]
-
-instance DataSource AppM PostsByAuthor where
-  batchFetch keys = do
-    pool <- asks appPool
-    let ids = [aid | PostsByAuthor aid <- toList keys]
-    rows <- liftIO $ withResource pool $ \conn ->
-      query conn "SELECT id, author_id, title FROM posts WHERE author_id = ANY(?)" (Only ids)
-    let grouped = HM.fromListWith (++) [(PostsByAuthor (postAuthorId p), [p]) | p <- rows]
-    pure $ HM.union grouped (HM.fromList [(k, []) | k <- toList keys])
+    pure $ HM.fromList [(UserById (userId u), u) | u <- rows]
 ```
 
-If your data source has no native batch API, implement `fetchOne` instead --
-the default `batchFetch` calls it for each key:
+The `AppM` parameter is *your* monad. If it has access to a connection
+pool, config, or anything else, your data source has access to it too.
+No special environment setup is needed.
+
+If your backend doesn't support batch lookups (e.g. a REST API that only
+fetches one item at a time), implement `fetchOne` instead. sofetch will
+call it for each key:
 
 ```haskell
-instance DataSource AppM UserId where
-  fetchOne (UserId uid) = lookupUserById uid
+instance DataSource AppM UserById where
+  fetchOne (UserById uid) = lookupUserById uid
 ```
+
+You still get deduplication and caching; you just don't get the batched
+SQL.
 
 ### 3. Write data-access code
 
-Program against `MonadFetch` -- don't commit to an implementation:
+Now use `fetch` in your application code. Program against the `MonadFetch`
+typeclass so your functions work with any implementation (production, tests,
+tracing):
 
 ```haskell
-getUserFeed :: (MonadFetch m n, DataSource m UserId, DataSource m PostsByAuthor)
+getUserFeed :: (MonadFetch m n, DataSource m UserById, DataSource m PostsByAuthor)
             => Int -> n (User, [Post])
 getUserFeed uid =
-  (,) <$> fetch (UserId uid) <*> fetch (PostsByAuthor uid)
+  (,) <$> fetch (UserById uid) <*> fetch (PostsByAuthor uid)
 ```
 
-You can also use `ApplicativeDo` if you prefer `do`-notation:
+These two fetches are independent (`<*>`), so sofetch batches them into a
+single round. If you prefer do-notation, enable `ApplicativeDo` and write
+the equivalent:
 
 ```haskell
 {-# LANGUAGE ApplicativeDo #-}
 
 getUserFeed uid = do
-  user  <- fetch (UserId uid)         -- batched together
-  posts <- fetch (PostsByAuthor uid)  -- in one round
+  user  <- fetch (UserById uid)        -- batched together
+  posts <- fetch (PostsByAuthor uid)   -- in one round
   pure (user, posts)
 ```
 
-Both forms produce the same batching behaviour -- `ApplicativeDo` is a
-convenience, not a requirement.
+Both forms produce identical batching behaviour.
 
 ### 4. Run it
-
-If your source monad has a `MonadUnliftIO` instance (true for any
-`ReaderT env IO` stack), use `fetchConfigIO` to build the config -- no
-manual natural transformations needed:
 
 ```haskell
 handleRequest :: AppEnv -> Int -> IO (User, [Post])
@@ -137,8 +206,113 @@ handleRequest env uid = runAppM env $ do
   runFetch cfg (getUserFeed uid)
 ```
 
-To preserve the cache across sequential phases, use `runFetch'` which
-returns the `CacheRef` alongside the result:
+`fetchConfigIO` works for any `MonadUnliftIO` monad (which includes any
+`ReaderT env IO` stack, the most common pattern). It wires everything up
+automatically.
+
+### 5. Test it
+
+Swap the real data sources for canned data. No IO, no database:
+
+```haskell
+testGetUserFeed :: IO ()
+testGetUserFeed = do
+  let mocks = mockData @UserById       [(UserById 1, testUser)]
+           <> mockData @PostsByAuthor   [(PostsByAuthor 1, [testPost])]
+  (user, posts) <- runMockFetch @AppM mocks (getUserFeed 1)
+  assertEqual user testUser
+  assertEqual posts [testPost]
+```
+
+Because `getUserFeed` is polymorphic over `MonadFetch`, it runs unchanged
+against `MockFetch`. No special test wiring needed.
+
+## A real example: collapsing N+1 cascades
+
+Here's a scenario from the included SQLite example. A blog page needs to
+render three authors, each with their posts, each post with its comments,
+each comment with its author name. The functions are written independently
+at four different levels:
+
+```
+renderBlogPage                    fetches 3 authors
+  └─ renderAuthorProfile          fetches posts for an author
+       └─ renderPostWithComments  fetches comments for a post
+            └─ renderComment      fetches the comment's author
+```
+
+Without sofetch, this is 25+ database queries. With sofetch, `traverse`
+automatically merges fetches at the same depth:
+
+```mermaid
+flowchart LR
+  subgraph R1 ["Round 1"]
+    A1["UserById 1, 2, 3"]
+  end
+  subgraph R2 ["Round 2"]
+    A2["PostsByAuthor 1, 2, 3"]
+  end
+  subgraph R3 ["Round 3"]
+    A3["CommentsByPost 1 … 7"]
+  end
+  subgraph R4 ["Round 4"]
+    A4["UserById 4, 5 (deduped)"]
+  end
+  R1 --> R2 --> R3 --> R4
+```
+
+**4 rounds, 4 SQL queries**, regardless of the data size. The functions
+never coordinate with each other. They don't know they're being composed.
+sofetch handles it.
+
+## Key features
+
+- **No GADTs.** Data sources are ordinary typeclasses. Key types use stock
+  `deriving`. If you've defined a newtype, you're 90% of the way to a data
+  source.
+- **Your monad, your resources.** `DataSource` is parameterised by your
+  monad, not some framework environment. Connection pools, config, whatever
+  your monad carries, your data sources have access to it. Missing
+  instances are compile-time errors, not runtime crashes.
+- **Monad transformer.** `Fetch m a` layers over your existing monad stack.
+  Drop it in without restructuring your application.
+- **Swappable implementations.** `MonadFetch` is the interface your
+  application code uses. Production, test, and traced implementations all
+  satisfy it. Swap without code changes.
+- **Extensible instrumentation.** `runLoopWith` lets you wrap each batch
+  round (e.g. with tracing spans). OpenTelemetry support lives in the
+  separate [`sofetch-otel`](./sofetch-otel) package.
+
+```mermaid
+flowchart TD
+  A["Application code"] -->|"programs against"| B["MonadFetch (typeclass)"]
+  B --> C["Fetch m<br/>production"]
+  B --> D["MockFetch<br/>testing"]
+  B --> E["TracedFetch<br/>instrumentation"]
+  C --> F["DataSource instances<br/>UserById · PostsByAuthor · …"]
+```
+
+## Combinators
+
+sofetch includes a toolkit for common patterns:
+
+| Combinator | What it does |
+|---|---|
+| `fetchAll keys` | Fetch a list of keys in one round |
+| `fetchThrough toKey items` | Extract a key from each item, fetch, pair back |
+| `fetchMap toKey combine items` | Like `fetchThrough` but transform the pair |
+| `fetchMaybe maybeKey` | Fetch if the key is present |
+| `fetchMapWith keys` | Fetch a collection, return a `HashMap` of results |
+| `filterA predicate items` | Applicative filter; all predicates batched |
+| `withDefault val action` | Return a default on any exception |
+| `pAnd` / `pOr` | Parallel short-circuiting boolean combinators |
+
+## Advanced usage
+
+### Shared cache across phases
+
+To preserve the cache across sequential computations, use `runFetch'` which
+returns the cache alongside the result:
 
 ```haskell
 handleTwoPhases :: AppEnv -> IO [Post]
@@ -147,54 +321,32 @@ handleTwoPhases env = runAppM env $ do
 
   -- Phase 1: populate cache
   (_users, cache) <- runFetch' cfg $
-    fetchAll [UserId 1, UserId 2, UserId 3]
+    fetchAll [UserById 1, UserById 2, UserById 3]
 
-  -- Phase 2: reuse the warm cache — cached keys resolve without hitting the DB
+  -- Phase 2: cached keys resolve without hitting the DB
   runFetch cfg { configCache = Just cache } $
     fetchAll [PostsByAuthor 1, PostsByAuthor 2]
 ```
 
-You can also create a `CacheRef` up front with `newCacheRef` and thread it
-through multiple `runFetch` calls via `cfg { configCache = Just cRef }`.
+### Restricted monads (no MonadIO)
 
-#### Monads without `MonadUnliftIO`
-
-For monads that deliberately avoid `MonadIO` (e.g. a `Transaction` type
-that prevents arbitrary IO inside database transactions), use `fetchConfig`
-with explicit natural transformations and export a convenience runner that
-hides the unsafe nats:
+For monads that deliberately hide IO (e.g. a `Transaction` type that
+prevents arbitrary IO inside database transactions), use `fetchConfig` with
+explicit natural transformations and export a safe runner:
 
 ```haskell
 fetchInTransaction :: Fetch Transaction a -> Transaction a
 fetchInTransaction = runFetch (fetchConfig unsafeRunTransaction unsafeLiftIO)
 ```
 
-The two natural transformations (`unsafeRunTransaction` and `unsafeLiftIO`)
-stay private to your DB module. Application code calls `fetchInTransaction`
-and never touches IO. The engine uses the nats internally for cache and IVar
-operations, but the public interface is completely safe.
+The unsafe escape hatches stay private to your DB module. Application code
+calls `fetchInTransaction` and never touches IO.
 
-See `examples/SqliteBlog.hs` (scenario 12) for a worked proof-of-concept with
-a `DB` monad that has no `MonadIO` instance.
-
-### 5. Test it
-
-Swap to `MockFetch` with canned data -- no IO, no database:
-
-```haskell
-testGetUserFeed :: IO ()
-testGetUserFeed = do
-  let mocks = mockData @UserId        [(UserId 1, testUser)]
-           <> mockData @PostsByAuthor  [(PostsByAuthor 1, [testPost])]
-  (user, posts) <- runMockFetch @AppM mocks (getUserFeed 1)
-  assertEqual user testUser
-  assertEqual posts [testPost]
-```
+See `examples/SqliteBlog.hs` (scenario 12) for a worked proof-of-concept.
 
 ## Examples
 
-The `examples/` directory contains two runnable programs that demonstrate
-sofetch against real-world backends. Build them with:
+The `examples/` directory contains two runnable programs:
 
 ```bash
 stack build --flag sofetch:examples
@@ -202,61 +354,15 @@ stack exec sqlite-blog
 stack exec github-explorer
 ```
 
-### SQLite blog platform (`examples/SqliteBlog.hs`)
+**SQLite blog** (`examples/SqliteBlog.hs`): A blog platform backed by
+in-memory SQLite. Every `batchFetch` prints its SQL so you can see exactly
+how fetches are batched. Covers applicative batching, N+1 avoidance,
+deduplication, deep N+1 across function boundaries, faceted queries, chunked
+batching, shared caches, mocks, and restricted monads.
 
-A blog platform with users, posts, and comments backed by an in-memory SQLite
-database. Every `batchFetch` prints the SQL it executes, and an instrumented
-runner shows round boundaries, key counts, and cache behaviour.
-
-Scenarios include:
-
-- **Applicative batching** -- two data sources dispatched concurrently in one round
-- **N+1 avoidance** -- fan-out from posts to comments in a single `WHERE IN` query
-- **Deduplication** -- overlapping author references across comments, fetched once
-- **Deep N+1 across function boundaries** -- four layers of independently-written
-  functions (`renderBlogPage` → `renderAuthorProfile` → `renderPostWithComments`
-  → `renderComment`), each fetching its own data. `traverse` merges all fetches
-  at the same depth into one round. Three authors × seven posts × twelve comments
-  collapses from 25+ queries to 4.
-- **Faceted queries** -- assembling search result cards where each card needs
-  four independent facets (post, author, comment count, latest comment). Five
-  cards × four facets = 20 potential queries; sofetch does it in 2 rounds / 5
-  SQL queries.
-- **Chunked batching** -- a `DataSource` that splits large `IN` clauses into
-  chunks of 50, transparent to the caller.
-- **Shared cache** -- two separate computations sharing a `CacheRef`, proving
-  that the second run resolves cached keys without hitting the database.
-- **MockFetch** -- the same polymorphic `getUserFeed` function run against both
-  real SQLite and canned mock data with zero code changes.
-- **Restricted DB monad** -- a `DB` type with no `MonadIO` instance
-  (mimicking Mercury's transaction monad), showing the
-  `fetchInTransaction`-style pattern where the unsafe natural transformations
-  are hidden behind a safe public runner.
-
-### GitHub API explorer (`examples/GitHubExplorer.hs`)
-
-Concurrent exploration of the GitHub REST API using `http-client-tls` and
-`aeson`. Demonstrates sofetch with HTTP backends where the value is
-concurrency, deduplication, and caching rather than SQL batching.
-
-Scenarios include concurrent fan-out, dedup + caching (same user from two code
-paths → one HTTP request), error handling with `tryFetch`, and combinators.
-
-## How batching works
-
-`Fetch` has an `Applicative` instance that merges pending fetches from both
-sides of `<*>` into a single round. The `Monad` instance introduces a round
-boundary at `>>=` (the right side depends on the left side's result).
-
-You can express independent fetches directly with `<*>` (or `liftA2`, etc.),
-or enable `ApplicativeDo` and let GHC desugar `do`-blocks into `Applicative`
-combinators wherever data dependencies allow. Either way, independent fetches
-batch automatically.
-
-Within each round, keys for the same data source are grouped into one
-`batchFetch` call. Keys for different sources run concurrently by default
-(configurable via `FetchStrategy`). Duplicate keys are deduplicated across the
-entire computation.
+**GitHub explorer** (`examples/GitHubExplorer.hs`): Concurrent exploration
+of the GitHub REST API. Demonstrates sofetch with HTTP backends where the
+value is concurrency, deduplication, and caching rather than SQL batching.
 
 ## Packages
 
@@ -264,18 +370,6 @@ entire computation.
 |---|---|
 | **sofetch** | Core library: `Fetch`, `DataSource`, `MonadFetch`, cache, engine, mocks, tracing hooks |
 | **[sofetch-otel](./sofetch-otel)** | OpenTelemetry instrumentation via `runFetchWithOTel` |
-
-## Extension API
-
-The core exports building blocks for custom instrumented runners:
-
-- `runLoopWith` -- wrap each batch round with before/after logic
-- `FetchEnv(..)` -- construct the internal environment
-- `executeBatches` / `RoundStats(..)` -- run batches directly
-- `Status(..)` / `Batches(..)` -- inspect fetch state
-
-See the [Extension API](./src/Fetch.hs) section in the module docs and
-[`sofetch-otel`](./sofetch-otel) for a worked example.
 
 ## Modules
 
@@ -297,4 +391,14 @@ See the [Extension API](./src/Fetch.hs) section in the module docs and
 ## Design
 
 See [docs/DESIGN.md](./docs/DESIGN.md) for the full set of design decisions
-and tradeoffs relative to Haxl.
+and tradeoffs.
+
+---
+
+<sub>sofetch is inspired by Facebook's [Haxl](https://github.com/facebook/Haxl)
+(Marlow et al., *There is no fork: an abstraction for efficient, concurrent,
+and concise data access*, ICFP 2014). It keeps the core idea (write
+sequential-looking code, get batched data access) while replacing the
+GADT-based data source API with type families and ordinary typeclasses, and
+using a monad-transformer design instead of a bespoke environment. See
+[DESIGN.md](./docs/DESIGN.md) for a detailed comparison.</sub>

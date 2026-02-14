@@ -2072,12 +2072,12 @@ instance MutationSource TestM FailMutation where
 -- ══════════════════════════════════════════════
 
 -- | Run a Mutate computation over TestM in IO.
-runMutateest :: TestEnv -> Mutate TestM TestM a -> IO a
-runMutateest env = runTestM env . runMutate (fetchConfig (runTestM env) testLiftIO)
+runMutateTest :: TestEnv -> Mutate TestM TestM a -> IO a
+runMutateTest env = runTestM env . runMutate (fetchConfig (runTestM env) testLiftIO)
 
 -- | Run a Mutate computation with an externally-provided cache.
-runMutateestWithCache :: TestEnv -> CacheRef -> Mutate TestM TestM a -> IO a
-runMutateestWithCache env cRef = runTestM env . runMutate ((fetchConfig (runTestM env) testLiftIO) { configCache = Just cRef })
+runMutateTestWithCache :: TestEnv -> CacheRef -> Mutate TestM TestM a -> IO a
+runMutateTestWithCache env cRef = runTestM env . runMutate ((fetchConfig (runTestM env) testLiftIO) { configCache = Just cRef })
 
 mutateSpec :: Spec
 mutateSpec = describe "Fetch.Mutate (Mutate)" $ do
@@ -2093,33 +2093,33 @@ mutateBasicSpec = describe "basic mutations" $ do
 
   it "mutate returns correct result" $ do
     env <- mkTestEnv
-    result <- runMutateest env $ mutate (UpdateUser (UserId 1) "NewAlice")
+    result <- runMutateTest env $ mutate (UpdateUser (UserId 1) "NewAlice")
     result `shouldBe` "updated-NewAlice-1"
 
   it "tryMutate returns Right on success" $ do
     env <- mkTestEnv
-    result <- runMutateest env $ tryMutate (UpdateUser (UserId 1) "NewAlice")
+    result <- runMutateTest env $ tryMutate (UpdateUser (UserId 1) "NewAlice")
     case result of
       Right v -> v `shouldBe` "updated-NewAlice-1"
       Left _  -> expectationFailure "Expected Right"
 
   it "tryMutate catches exception" $ do
     env <- mkTestEnv
-    result <- runMutateest env $ tryMutate FailMutation
+    result <- runMutateTest env $ tryMutate FailMutation
     case result of
       Left _  -> pure ()
       Right _ -> expectationFailure "Expected Left"
 
   it "mutate throws on exception" $ do
     env <- mkTestEnv
-    result <- try @SomeException $ runMutateest env $ mutate FailMutation
+    result <- try @SomeException $ runMutateTest env $ mutate FailMutation
     case result of
       Left _  -> pure ()
       Right _ -> expectationFailure "Expected exception"
 
   it "pure with no mutations completes immediately" $ do
     env <- mkTestEnv
-    result <- runMutateest env $ pure (42 :: Int)
+    result <- runMutateTest env $ pure (42 :: Int)
     result `shouldBe` 42
 
 mutateFetchInteractionSpec :: Spec
@@ -2127,19 +2127,19 @@ mutateFetchInteractionSpec = describe "fetch-mutate-fetch interaction" $ do
 
   it "fetch works within Mutate" $ do
     env <- mkTestEnv
-    result <- runMutateest env $ fetch (UserId 1)
+    result <- runMutateTest env $ fetch (UserId 1)
     result `shouldBe` "Alice"
 
   it "tryFetch works within Mutate" $ do
     env <- mkTestEnv
-    result <- runMutateest env $ tryFetch (UserId 1)
+    result <- runMutateTest env $ tryFetch (UserId 1)
     case result of
       Right v -> v `shouldBe` "Alice"
       Left _  -> expectationFailure "Expected Right"
 
   it "fetch-mutate-fetch: second fetch sees primed cache from reconcileCache" $ do
     env <- mkTestEnv
-    (valBefore, valAfter) <- runMutateest env $ do
+    (valBefore, valAfter) <- runMutateTest env $ do
       b <- fetch (UserId 1)
       _ <- mutate (UpdateUser (UserId 1) "NewAlice")
       a <- fetch (UserId 1)
@@ -2152,7 +2152,7 @@ mutateFetchInteractionSpec = describe "fetch-mutate-fetch interaction" $ do
   it "fetch after delete mutation misses cache" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
-    _ <- runMutateestWithCache env cRef $ do
+    _ <- runMutateTestWithCache env cRef $ do
       _ <- fetch (UserId 1)
       _ <- mutate (DeleteUser (UserId 1))
       tryFetch (UserId 1)
@@ -2161,7 +2161,7 @@ mutateFetchInteractionSpec = describe "fetch-mutate-fetch interaction" $ do
 
   it "multiple fetches batch in a single round within Mutate" $ do
     env <- mkTestEnv
-    (a, b) <- runMutateest env $
+    (a, b) <- runMutateTest env $
       (,) <$> fetch (UserId 1) <*> fetch (UserId 2)
     a `shouldBe` "Alice"
     b `shouldBe` "Bob"
@@ -2170,7 +2170,7 @@ mutateFetchInteractionSpec = describe "fetch-mutate-fetch interaction" $ do
 
   it "primeCache works within Mutate" $ do
     env <- mkTestEnv
-    result <- runMutateest env $ do
+    result <- runMutateTest env $ do
       primeCache (UserId 1) "Primed"
       fetch (UserId 1)
     result `shouldBe` "Primed"
@@ -2182,7 +2182,7 @@ mutateApplicativeSpec = describe "applicative behavior" $ do
 
   it "fetches batch, mutation fires only after all fetches" $ do
     env <- mkTestEnv
-    (user, updated, post) <- runMutateest env $
+    (user, updated, post) <- runMutateTest env $
       (,,)
         <$> fetch (UserId 1)
         <*> mutate (UpdateUser (UserId 2) "NewBob")
@@ -2197,7 +2197,7 @@ mutateApplicativeSpec = describe "applicative behavior" $ do
 
   it "two mutations in <*>: both execute sequentially (left then right)" $ do
     env <- mkTestEnv
-    (r1, r2) <- runMutateest env $
+    (r1, r2) <- runMutateTest env $
       (,) <$> mutate (UpdateUser (UserId 1) "First")
           <*> mutate (UpdateUser (UserId 2) "Second")
     r1 `shouldBe` "updated-First-1"
@@ -2205,13 +2205,13 @@ mutateApplicativeSpec = describe "applicative behavior" $ do
 
   it "fmap over mutation result transforms it" $ do
     env <- mkTestEnv
-    result <- runMutateest env $
+    result <- runMutateTest env $
       fmap (++ "!") (mutate (UpdateUser (UserId 1) "Bang"))
     result `shouldBe` "updated-Bang-1!"
 
   it "three-way applicative: fetch + mutation + fetch" $ do
     env <- mkTestEnv
-    (a, b, c) <- runMutateest env $
+    (a, b, c) <- runMutateTest env $
       (,,) <$> fetch (UserId 1)
            <*> mutate (UpdateUser (UserId 2) "M")
            <*> fetch (UserId 3)
@@ -2224,7 +2224,7 @@ mutateMonadicSpec = describe "monadic behavior" $ do
 
   it "fetch >>= mutate >>= fetch: correct sequencing" $ do
     env <- mkTestEnv
-    (valBefore, result, valAfter) <- runMutateest env $ do
+    (valBefore, result, valAfter) <- runMutateTest env $ do
       b <- fetch (UserId 1)
       r <- mutate (UpdateUser (UserId 1) "Updated")
       a <- fetch (UserId 1)
@@ -2235,14 +2235,14 @@ mutateMonadicSpec = describe "monadic behavior" $ do
 
   it "mutation result used in subsequent fetch key" $ do
     env <- mkTestEnv
-    result <- runMutateest env $ do
+    result <- runMutateTest env $ do
       _ <- mutate (UpdateUser (UserId 1) "Dynamic")
       fetch (UserId 2)
     result `shouldBe` "Bob"
 
   it "two sequential mutations" $ do
     env <- mkTestEnv
-    (r1, r2) <- runMutateest env $ do
+    (r1, r2) <- runMutateTest env $ do
       a <- mutate (UpdateUser (UserId 1) "First")
       b <- mutate (UpdateUser (UserId 2) "Second")
       pure (a, b)
@@ -2251,7 +2251,7 @@ mutateMonadicSpec = describe "monadic behavior" $ do
 
   it "conditional mutation based on fetch result" $ do
     env <- mkTestEnv
-    result <- runMutateest env $ do
+    result <- runMutateTest env $ do
       name <- fetch (UserId 1)
       if name == "Alice"
         then mutate (UpdateUser (UserId 1) "ConditionalUpdate")
@@ -2260,7 +2260,7 @@ mutateMonadicSpec = describe "monadic behavior" $ do
 
   it "tryMutate failure doesn't prevent subsequent operations" $ do
     env <- mkTestEnv
-    (err, val) <- runMutateest env $ do
+    (err, val) <- runMutateTest env $ do
       e <- tryMutate FailMutation
       v <- fetch (UserId 1)
       pure (e, v)
@@ -2322,7 +2322,7 @@ mutateCacheReconcileSpec = describe "cache reconciliation" $ do
   it "reconcileCache evicts stale keys after DeleteUser" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
-    _ <- runMutateestWithCache env cRef $ do
+    _ <- runMutateTestWithCache env cRef $ do
       _ <- fetch (UserId 1)
       mutate (DeleteUser (UserId 1))
     hit <- cacheLookup cRef (UserId 1)
@@ -2333,7 +2333,7 @@ mutateCacheReconcileSpec = describe "cache reconciliation" $ do
   it "reconcileCache primes fresh values after UpdateUser" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
-    _ <- runMutateestWithCache env cRef $
+    _ <- runMutateTestWithCache env cRef $
       mutate (UpdateUser (UserId 1) "Fresh")
     hit <- cacheLookup cRef (UserId 1)
     case hit of
@@ -2343,9 +2343,9 @@ mutateCacheReconcileSpec = describe "cache reconciliation" $ do
   it "cache shared across runMutateWithCache: mutation effects persist" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
-    _ <- runMutateestWithCache env cRef $
+    _ <- runMutateTestWithCache env cRef $
       mutate (UpdateUser (UserId 1) "Shared")
-    result <- runMutateestWithCache env cRef $
+    result <- runMutateTestWithCache env cRef $
       fetch (UserId 1)
     result `shouldBe` "updated-Shared-1"
     batches <- readIORef (envUserLog env)
@@ -2959,7 +2959,7 @@ throwCatchSpec = describe "MonadThrow / MonadCatch" $ do
 
   it "throwM/catch in Mutate works" $ do
     env <- mkTestEnv
-    result <- runMutateest env $
+    result <- runMutateTest env $
       MC.catch
         (MC.throwM (TestException "mut") :: Mutate TestM TestM String)
         (\(TestException msg) -> pure ("caught: " <> msg))
@@ -3187,7 +3187,7 @@ asyncMutateSpec = describe "Mutate" $ do
   it "cancel before mutation: mutation never executes" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
-    handle <- async $ runMutateestWithCache env cRef $ do
+    handle <- async $ runMutateTestWithCache env cRef $ do
       _ <- fetch (UserId 1)       -- round 1: succeeds
       _ <- fetch (BlockingKey 1)  -- round 2: blocks, gets cancelled
       mutate (UpdateUser (UserId 1) "ShouldNotHappen")
@@ -3203,7 +3203,7 @@ asyncMutateSpec = describe "Mutate" $ do
 
   it "cancel during fetch phase of Mutate propagates exception" $ do
     env <- mkTestEnv
-    handle <- async $ runMutateest env $ do
+    handle <- async $ runMutateTest env $ do
       fetch (BlockingKey 1)  -- blocks, gets cancelled
     takeMVar (envAsyncStarted env)
     cancel handle
