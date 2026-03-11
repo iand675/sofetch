@@ -5,13 +5,15 @@ cabal-version: 2.2
 -- see: https://github.com/sol/hpack
 
 name:           sofetch
-version:        0.1.0.0
+version:        0.1.0.3
+synopsis:       A low-boilerplate Haxl-like data fetching library
 description:    Please see the README on GitHub at <https://github.com/githubuser/sofetch#readme>
+category:       Data
 homepage:       https://github.com/iand675/sofetch#readme
 bug-reports:    https://github.com/iand675/sofetch/issues
-author:         Author name here
-maintainer:     example@example.com
-copyright:      2026 Author name here
+author:         Ian Duncan
+maintainer:     ian@iankduncan.com
+copyright:      2026 Ian Duncan
 license:        BSD-3-Clause
 license-file:   LICENSE
 build-type:     Simple

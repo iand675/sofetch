@@ -20,10 +20,11 @@ import Fetch.Combinators (biselect, pAnd, pOr)
 import Fetch.IVar
 import Fetch.Cache
 
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, yield)
 import Control.Concurrent.Async (async, wait, waitCatch, cancel, replicateConcurrently_)
 import Control.Concurrent.MVar
 import Control.Exception (SomeException, toException, try, throwTo)
+import System.Timeout (timeout)
 import qualified Control.Monad.Catch as MC
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HM
@@ -354,6 +355,20 @@ runTestWithRoundLog env action = do
   lg <- readIORef logRef
   pure (a, lg)
 
+-- | Like 'it' but fails with a clear message if the test body doesn't
+-- complete within 5 seconds, preventing the suite from hanging forever.
+-- Uses async+cancel so the timeout exception is delivered even if the
+-- action is in a tight non-allocating loop.
+timed :: String -> IO () -> Spec
+timed name action = it name $ do
+  handle <- async action
+  result <- timeout 5000000 (wait handle)
+  case result of
+    Just () -> pure ()
+    Nothing -> do
+      cancel handle
+      expectationFailure "Test timed out (possible deadlock)"
+
 instance MC.MonadThrow TestM where
   throwM = testLiftIO . MC.throwM
 
@@ -489,7 +504,7 @@ ivarSpec = describe "Fetch.IVar" $ do
       Right v -> v `shouldBe` 1
       Left _  -> expectationFailure "Expected Right (value should win)"
 
-  it "multiple concurrent readers all get same value" $ do
+  timed "multiple concurrent readers all get same value" $ do
     iv <- newIVar
     vars <- mapM (\_ -> do
       v <- newEmptyMVar
@@ -1119,7 +1134,7 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
       dispLog `shouldContain` ["UserId"]
       dispLog `shouldContain` ["PostId"]
 
-    it "left immediate Left, right blocked → batch never executed (MVar proof)" $ do
+    timed "left immediate Left, right blocked → batch never executed (MVar proof)" $ do
       env <- mkTestEnv
       -- BlockingKey's batchFetch signals envAsyncStarted then blocks on envAsyncProceed.
       -- If biselect short-circuits, that batchFetch is never called.
@@ -1132,7 +1147,7 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
       started <- tryTakeMVar (envAsyncStarted env)
       started `shouldBe` Nothing
 
-    it "right immediate Left, left blocked → batch never executed (MVar proof)" $ do
+    timed "right immediate Left, left blocked → batch never executed (MVar proof)" $ do
       env <- mkTestEnv
       result <- runTest env $
         biselect
@@ -1142,7 +1157,7 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
       started <- tryTakeMVar (envAsyncStarted env)
       started `shouldBe` Nothing
 
-    it "both blocked, left resolves Left → right continuation abandoned (MVar proof)" $ do
+    timed "both blocked, left resolves Left → right continuation abandoned (MVar proof)" $ do
       env <- mkTestEnv
       -- Round 1: fetch UserId and PostId (both fast).
       -- After round 1: left produces Left, right would need BlockingKey (never reached).
@@ -1179,7 +1194,7 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
       result <- runTest env $ pOr (pure False) (pure False)
       result `shouldBe` False
 
-    it "left pure True → right fetch never executed (MVar proof)" $ do
+    timed "left pure True → right fetch never executed (MVar proof)" $ do
       env <- mkTestEnv
       result <- runTest env $
         pOr (pure True) (const False <$> fetch (BlockingKey 1))
@@ -1187,7 +1202,7 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
       started <- tryTakeMVar (envAsyncStarted env)
       started `shouldBe` Nothing
 
-    it "right pure True → left fetch never executed (MVar proof)" $ do
+    timed "right pure True → left fetch never executed (MVar proof)" $ do
       env <- mkTestEnv
       result <- runTest env $
         pOr (const False <$> fetch (BlockingKey 1)) (pure True)
@@ -1213,7 +1228,7 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
       result `shouldBe` False
       length rounds `shouldBe` 1
 
-    it "multi-round: left True after round 1, right's round 2 abandoned (MVar proof)" $ do
+    timed "multi-round: left True after round 1, right's round 2 abandoned (MVar proof)" $ do
       env <- mkTestEnv
       (result, rounds) <- runTestWithRoundLog env $
         pOr
@@ -1250,7 +1265,7 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
       result <- runTest env $ pAnd (pure False) (pure True)
       result `shouldBe` False
 
-    it "left pure False → right fetch never executed (MVar proof)" $ do
+    timed "left pure False → right fetch never executed (MVar proof)" $ do
       env <- mkTestEnv
       result <- runTest env $
         pAnd (pure False) (const True <$> fetch (BlockingKey 1))
@@ -1258,7 +1273,7 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
       started <- tryTakeMVar (envAsyncStarted env)
       started `shouldBe` Nothing
 
-    it "right pure False → left fetch never executed (MVar proof)" $ do
+    timed "right pure False → left fetch never executed (MVar proof)" $ do
       env <- mkTestEnv
       result <- runTest env $
         pAnd (const True <$> fetch (BlockingKey 1)) (pure False)
@@ -1284,7 +1299,7 @@ biselectSpec = describe "biselect / pAnd / pOr" $ do
       result `shouldBe` False
       length rounds `shouldBe` 1
 
-    it "multi-round: left False after round 1, right's round 2 abandoned (MVar proof)" $ do
+    timed "multi-round: left False after round 1, right's round 2 abandoned (MVar proof)" $ do
       env <- mkTestEnv
       (result, rounds) <- runTestWithRoundLog env $
         pAnd
@@ -1622,7 +1637,7 @@ raceSpec = describe "Race conditions" $ do
 ivarRaceSpec :: Spec
 ivarRaceSpec = describe "IVar" $ do
 
-  it "concurrent write storm: exactly one winner across 100 threads" $ do
+  timed "concurrent write storm: exactly one winner across 100 threads" $ do
     iv <- newIVar
     doneVars <- mapM (\_ -> newEmptyMVar) [1 :: Int .. 100]
     barrier <- newEmptyMVar
@@ -1638,7 +1653,7 @@ ivarRaceSpec = describe "IVar" $ do
       Right v -> v `shouldSatisfy` (\x -> x >= 1 && x <= 100)
       Left _  -> expectationFailure "Expected Right"
 
-  it "concurrent error + value writes: one winner, all readers agree" $ do
+  timed "concurrent error + value writes: one winner, all readers agree" $ do
     iv <- newIVar
     let n = 100
     doneVars <- mapM (\_ -> newEmptyMVar) [1 :: Int .. n]
@@ -1663,7 +1678,7 @@ ivarRaceSpec = describe "IVar" $ do
           Left _  -> pure ()
           Right _ -> expectationFailure "Inconsistent: first was Left, got Right") rest
 
-  it "reader-writer interleave: N readers unblocked by single write" $ do
+  timed "reader-writer interleave: N readers unblocked by single write" $ do
     iv <- newIVar
     let numReaders = 50
     resultVars <- mapM (\_ -> newEmptyMVar) [1 :: Int .. numReaders]
@@ -1674,7 +1689,7 @@ ivarRaceSpec = describe "IVar" $ do
       Right v -> v `shouldBe` 42
       Left _  -> expectationFailure "Expected Right") results
 
-  it "rapid alloc-write-read cycle stress (1000 iterations)" $ do
+  timed "rapid alloc-write-read cycle stress (1000 iterations)" $ do
     mapM_ (\i -> do
       iv <- newIVar
       writeIVar iv (i :: Int)
@@ -1691,7 +1706,7 @@ ivarRaceSpec = describe "IVar" $ do
 cacheRaceSpec :: Spec
 cacheRaceSpec = describe "Cache" $ do
 
-  it "concurrent cacheAllocate same key: exactly one allocator wins" $ do
+  timed "concurrent cacheAllocate same key: exactly one allocator wins" $ do
     cRef <- newCacheRef
     resultsVar <- newIORef ([] :: [Int])
     barrier <- newEmptyMVar
@@ -1709,7 +1724,7 @@ cacheRaceSpec = describe "Cache" $ do
     let allocators = filter (> 0) results
     length allocators `shouldBe` 1
 
-  it "cacheAllocate + cacheEvict interleave: no corruption" $ do
+  timed "cacheAllocate + cacheEvict interleave: no corruption" $ do
     cRef <- newCacheRef
     barrier <- newEmptyMVar
     h1 <- async $ do
@@ -1730,7 +1745,7 @@ cacheRaceSpec = describe "Cache" $ do
       CacheHitReady v -> v `shouldBe` "value"
       CacheHitPending _ -> pure ()
 
-  it "cacheWarm + cacheLookup concurrent: never corrupt state" $ do
+  timed "cacheWarm + cacheLookup concurrent: never corrupt state" $ do
     cRef <- newCacheRef
     let warmMap = HM.fromList [ (UserId i, "user-" <> show i)
                                | i <- [1..100] ]
@@ -1754,7 +1769,7 @@ cacheRaceSpec = describe "Cache" $ do
     bad <- readIORef badRef
     bad `shouldBe` False
 
-  it "cacheInsert after concurrent evict: no crash" $ do
+  timed "cacheInsert after concurrent evict: no crash" $ do
     cRef <- newCacheRef
     _ <- cacheAllocate @UserId cRef [UserId 1]
     barrier <- newEmptyMVar
@@ -1773,7 +1788,7 @@ cacheRaceSpec = describe "Cache" $ do
       CacheHitReady _ -> pure ()
       CacheHitPending _ -> pure ()
 
-  it "concurrent cacheWarm different keys: both sets present" $ do
+  timed "concurrent cacheWarm different keys: both sets present" $ do
     cRef <- newCacheRef
     let set1 = HM.fromList [ (UserId i, "a-" <> show i) | i <- [1..50] ]
         set2 = HM.fromList [ (UserId i, "b-" <> show i) | i <- [51..100] ]
@@ -1784,7 +1799,7 @@ cacheRaceSpec = describe "Cache" $ do
     contents <- cacheContents @UserId cRef Proxy
     mapM_ (\i -> HM.member (UserId i) contents `shouldBe` True) [1..100]
 
-  it "cacheContents during concurrent writes: internally consistent" $ do
+  timed "cacheContents during concurrent writes: internally consistent" $ do
     cRef <- newCacheRef
     barrier <- newEmptyMVar
     h1 <- async $ do
@@ -1810,7 +1825,7 @@ cacheRaceSpec = describe "Cache" $ do
 engineRaceSpec :: Spec
 engineRaceSpec = describe "Engine dispatch" $ do
 
-  it "concurrent executeBatches on same CacheRef: no crash, all IVars filled" $ do
+  timed "concurrent executeBatches on same CacheRef: no crash, all IVars filled" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
     let b1 = singletonBatch @TestM (UserId 1) <> singletonBatch @TestM (UserId 2)
@@ -1846,7 +1861,7 @@ engineRaceSpec = describe "Engine dispatch" $ do
     length results `shouldBe` 100
     results `shouldBe` ["range-" <> show i | i <- [1 :: Int .. 100]]
 
-  it "concurrent runFetchWithCache from multiple threads: no crash" $ do
+  timed "concurrent runFetchWithCache from multiple threads: no crash" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
     barrier <- newEmptyMVar
@@ -1868,7 +1883,7 @@ engineRaceSpec = describe "Engine dispatch" $ do
 fetchTRaceSpec :: Spec
 fetchTRaceSpec = describe "Fetch / primeCache" $ do
 
-  it "concurrent primeCache + fetch for same key: no corruption" $ do
+  timed "concurrent primeCache + fetch for same key: no corruption" $ do
     mapM_ (\_ -> do
       env <- mkTestEnv
       cRef <- newCacheRef
@@ -1887,7 +1902,7 @@ fetchTRaceSpec = describe "Fetch / primeCache" $ do
       result `shouldSatisfy` (\v -> v == "primed" || v == "Alice")
       ) [1 :: Int .. 50]
 
-  it "primeCache into pending IVar while batch in flight" $ do
+  timed "primeCache into pending IVar while batch in flight" $ do
     env0 <- mkTestEnv
     slowBarrier <- newEmptyMVar
     let env' = env0 { envSlowBarrier = slowBarrier }
@@ -1900,14 +1915,14 @@ fetchTRaceSpec = describe "Fetch / primeCache" $ do
           hit <- cacheLookup cRef (SlowKey 1)
           case hit of
             CacheHitPending _ -> pure ()
-            _                 -> waitForPending
+            _                 -> yield >> waitForPending
     waitForPending
     runTestWithCache env' cRef $ primeCache (SlowKey 1) "primed-value"
     putMVar slowBarrier ()
     result <- takeMVar fetchDone
     result `shouldBe` "primed-value"
 
-  it "concurrent primeCache storm: one value wins" $ do
+  timed "concurrent primeCache storm: one value wins" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
     barrier <- newEmptyMVar
@@ -1925,7 +1940,7 @@ fetchTRaceSpec = describe "Fetch / primeCache" $ do
     let hasPrimePrefix v = take 6 v == "prime-"
     result `shouldSatisfy` (\v -> hasPrimePrefix v || v == "Alice")
 
-  it "primeCache + cacheEvict race: no crash" $ do
+  timed "primeCache + cacheEvict race: no crash" $ do
     mapM_ (\_ -> do
       env <- mkTestEnv
       cRef <- newCacheRef
@@ -1953,7 +1968,7 @@ fetchTRaceSpec = describe "Fetch / primeCache" $ do
 memoRaceSpec :: Spec
 memoRaceSpec = describe "Memo" $ do
 
-  it "concurrent memo same key: action runs at most a few times" $ do
+  timed "concurrent memo same key: action runs at most a few times" $ do
     store <- newMemoStore
     callCount <- newIORef (0 :: Int)
     barrier <- newEmptyMVar
@@ -1972,7 +1987,7 @@ memoRaceSpec = describe "Memo" $ do
     count <- readIORef callCount
     count `shouldSatisfy` (< n)
 
-  it "concurrent memoOn same key: action runs at most a few times" $ do
+  timed "concurrent memoOn same key: action runs at most a few times" $ do
     store <- newMemoStore
     callCount <- newIORef (0 :: Int)
     barrier <- newEmptyMVar
@@ -1991,7 +2006,7 @@ memoRaceSpec = describe "Memo" $ do
     count <- readIORef callCount
     count `shouldSatisfy` (< n)
 
-  it "concurrent memo different keys: each runs exactly once" $ do
+  timed "concurrent memo different keys: each runs exactly once" $ do
     store <- newMemoStore
     callCount <- newIORef (0 :: Int)
     let n = 100
@@ -2986,7 +3001,7 @@ asyncExceptionSpec = describe "Async exception safety" $ do
 asyncIVarSpec :: Spec
 asyncIVarSpec = describe "IVar" $ do
 
-  it "awaitIVar is interruptible by throwTo" $ do
+  timed "awaitIVar is interruptible by throwTo" $ do
     iv <- newIVar @Int
     started <- newEmptyMVar
     resultVar <- newEmptyMVar
@@ -3003,7 +3018,7 @@ asyncIVarSpec = describe "IVar" $ do
       Left _  -> pure ()
       Right _ -> expectationFailure "Expected async exception from throwTo"
 
-  it "IVar writable after reader is killed; new reader sees value" $ do
+  timed "IVar writable after reader is killed; new reader sees value" $ do
     iv <- newIVar @Int
     started <- newEmptyMVar
     done <- newEmptyMVar
@@ -3022,7 +3037,7 @@ asyncIVarSpec = describe "IVar" $ do
       Right v -> v `shouldBe` 42
       Left _  -> expectationFailure "Expected Right after writeIVar"
 
-  it "multiple readers: kill one, others still see value when written" $ do
+  timed "multiple readers: kill one, others still see value when written" $ do
     iv <- newIVar @Int
     started1 <- newEmptyMVar
     started2 <- newEmptyMVar
@@ -3049,7 +3064,7 @@ asyncIVarSpec = describe "IVar" $ do
 asyncFetchSpec :: Spec
 asyncFetchSpec = describe "Fetch" $ do
 
-  it "cancel during batch execution propagates to caller" $ do
+  timed "cancel during batch execution propagates to caller" $ do
     env <- mkTestEnv
     handle <- async $ runTest env $ fetch (BlockingKey 1)
     -- Wait until the batch is in flight
@@ -3063,7 +3078,7 @@ asyncFetchSpec = describe "Fetch" $ do
     _ <- tryPutMVar (envAsyncProceed env) ()
     pure ()
 
-  it "completed results remain cached after later round is cancelled" $ do
+  timed "completed results remain cached after later round is cancelled" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
     handle <- async $ runTestWithCache env cRef $ do
@@ -3079,7 +3094,7 @@ asyncFetchSpec = describe "Fetch" $ do
       CacheHitReady v -> v `shouldBe` "Alice"
       _               -> expectationFailure "Expected CacheHitReady for UserId 1"
 
-  it "concurrent threads sharing cache: cancel one, other completes" $ do
+  timed "concurrent threads sharing cache: cancel one, other completes" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
     -- Thread A: fetches UserId 1, then blocks on BlockingKey
@@ -3096,7 +3111,7 @@ asyncFetchSpec = describe "Fetch" $ do
     _ <- tryPutMVar (envAsyncProceed env) ()
     pure ()
 
-  it "background batch thread fills IVars after parent is cancelled" $ do
+  timed "background batch thread fills IVars after parent is cancelled" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
     handle <- async $ runTestWithCache env cRef $ do
@@ -3117,7 +3132,7 @@ asyncFetchSpec = describe "Fetch" $ do
       CacheHitReady v -> v `shouldBe` "blocking-1"
       CacheMiss -> expectationFailure "Expected cache entry for BlockingKey 1"
 
-  it "MonadCatch handler is NOT invoked for async exceptions during batch execution" $ do
+  timed "MonadCatch handler is NOT invoked for async exceptions during batch execution" $ do
     -- Fetch's catch wraps the probe phase, not batch execution.
     -- Async exceptions during executeBatches bypass MonadCatch.
     env <- mkTestEnv
@@ -3141,7 +3156,7 @@ asyncFetchSpec = describe "Fetch" $ do
     called <- readIORef handlerCalled
     called `shouldBe` False
 
-  it "throwTo with custom exception reaches caller via try" $ do
+  timed "throwTo with custom exception reaches caller via try" $ do
     env <- mkTestEnv
     started <- newEmptyMVar
     resultVar <- newEmptyMVar
@@ -3160,7 +3175,7 @@ asyncFetchSpec = describe "Fetch" $ do
     _ <- tryPutMVar (envAsyncProceed env) ()
     pure ()
 
-  it "cache not corrupted by cancelled computation; fresh run succeeds" $ do
+  timed "cache not corrupted by cancelled computation; fresh run succeeds" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
     -- First run: fetch user, then block and get cancelled
@@ -3184,7 +3199,7 @@ asyncFetchSpec = describe "Fetch" $ do
 asyncMutateSpec :: Spec
 asyncMutateSpec = describe "Mutate" $ do
 
-  it "cancel before mutation: mutation never executes" $ do
+  timed "cancel before mutation: mutation never executes" $ do
     env <- mkTestEnv
     cRef <- newCacheRef
     handle <- async $ runMutateTestWithCache env cRef $ do
@@ -3201,7 +3216,7 @@ asyncMutateSpec = describe "Mutate" $ do
       CacheHitReady v -> v `shouldBe` "Alice"
       _               -> expectationFailure "Expected CacheHitReady for UserId 1"
 
-  it "cancel during fetch phase of Mutate propagates exception" $ do
+  timed "cancel during fetch phase of Mutate propagates exception" $ do
     env <- mkTestEnv
     handle <- async $ runMutateTest env $ do
       fetch (BlockingKey 1)  -- blocks, gets cancelled
