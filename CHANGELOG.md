@@ -8,6 +8,15 @@ and this project adheres to the
 
 ## Unreleased
 
+## 0.1.0.4 — 2026-03-11
+
+### Changed
+
+- Added PVP-compliant upper bounds to all dependencies.
+- Moved `CHANGELOG.md` to `extra-doc-files` so Hackage renders it on
+  the package page.
+- Fixed `description` URL to point to the correct GitHub repository.
+
 ## 0.1.0.3 — 2026-03-11
 
 ### Fixed

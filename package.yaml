@@ -1,5 +1,5 @@
 name:                sofetch
-version:             0.1.0.3
+version:             0.1.0.4
 github:              "iand675/sofetch"
 license:             BSD-3-Clause
 author:              "Ian Duncan"
@@ -10,29 +10,24 @@ synopsis:            A low-boilerplate Haxl-like data fetching library
 
 extra-source-files:
 - README.md
+
+extra-doc-files:
 - CHANGELOG.md
 
-# Metadata used when publishing your package
-# synopsis:            Short description of your package
-# category:            Web
-
-# To avoid duplicated efforts in documentation and dealing with the
-# complications of embedding Haddock markup inside cabal files, it is
-# common to point users to the README.md file.
-description:         Please see the README on GitHub at <https://github.com/githubuser/sofetch#readme>
+description:         Please see the README on GitHub at <https://github.com/iand675/sofetch#readme>
 
 dependencies:
 - base >= 4.7 && < 5
-- async
-- containers
-- exceptions
-- hashable
-- semigroupoids
-- text
-- time
-- transformers
-- unliftio-core
-- unordered-containers
+- async >= 2.2 && < 2.3
+- containers >= 0.6 && < 0.8
+- exceptions >= 0.10 && < 0.11
+- hashable >= 1.4 && < 1.6
+- semigroupoids >= 6.0 && < 6.1
+- text >= 1.2 && < 2.2
+- time >= 1.9 && < 1.15
+- transformers >= 0.5 && < 0.7
+- unliftio-core >= 0.2 && < 0.3
+- unordered-containers >= 0.2.16 && < 0.3
 
 ghc-options:
 - -Wall
